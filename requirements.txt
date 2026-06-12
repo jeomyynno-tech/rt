@@ -1,0 +1,19 @@
+# Обязательные (все платформы)
+psutil>=5.9.0
+Pillow>=10.0.0
+mss>=9.0.0
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+flask>=3.0.0
+pynput>=1.7.6
+websockets>=12.0
+
+# Безопасность (настоятельно рекомендуется)
+bcrypt>=4.0.0       # bcrypt хэширование паролей
+
+# Windows — устранение мерцания курсора + быстрый скролл
+# dxcam: захват через DXGI (GPU), курсор не мерцает
+#   pip install dxcam
+# pywin32: быстрый скролл через win32api
+#   pip install pywin32
+#   python -m pywin32_postinstall -install

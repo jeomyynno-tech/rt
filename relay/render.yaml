@@ -1,0 +1,22 @@
+# Деплой на Render.com
+# 1. Создайте новый Web Service в Render Dashboard
+# 2. Подключите GitHub-репозиторий
+# 3. Настройте переменные среды:
+#    OPERATOR_PASSWORD = ваш_пароль_оператора (12+ символов)
+# 4. Build Command и Start Command возьмутся из этого файла
+
+services:
+  - type: web
+    name: remote-access-relay
+    runtime: python
+    region: frankfurt   # ближе к РФ чем US
+    plan: free           # free tier: засыпает через 15 мин неактивности
+                         # starter ($7/мес): работает постоянно
+    buildCommand: pip install -r relay/requirements.txt
+    startCommand: python -m uvicorn relay.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPERATOR_PASSWORD
+        sync: false        # задать вручную в Render Dashboard → Environment
+      - key: SECRET_KEY
+        generateValue: true
+    healthCheckPath: /health

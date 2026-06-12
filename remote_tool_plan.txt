@@ -1,0 +1,369 @@
+Remote Access Tool
+Detailed Project Plan • Code Structure Reference
+================================================================================
+
+1. SYSTEM ARCHITECTURE
+================================================================================
+
+The only operator interaction mode is a web browser. CLI client and Tor are
+excluded from the current architecture.
+
+Component         Folder        Role
+---------------------------------------------------------------------------
+Agent (Win/Linux) server/       Captures screen, executes commands, connects
+                                to Relay via WebSocket.
+Relay (Render.com) relay/       FastAPI: WS server for agents + binary stream.
+                                Flask: operator web interface.
+Operator          browser       Opens https://relay.onrender.com, selects an
+                                agent, controls via UI.
+
+Data Flow — Stream
+  Agent -> WS(scr) -> relay/main.py ws_agent -> _pending[req_id]
+        -> ws_stream -> WSS -> browser
+
+Data Flow — Commands
+  browser -> HTTPS -> Flask route -> _relay_call_sync() -> asyncio
+          -> WS(cmd) -> agent -> response
+
+
+================================================================================
+2. FILE STRUCTURE — REFERENCE FOR EDITS
+================================================================================
+
+For each file: what it does and where exactly to look when working on
+specific tasks.
+
+--------------------------------------------------------------------------------
+server/handler.py — handling all commands on the agent
+--------------------------------------------------------------------------------
+
+File / Class              What it does                  Where to look when editing
+---------------------------------------------------------------------------
+class _Capturer           Screen capture. dxcam (DXGI)  grab(quality, fmt, capturer)
+                          and mss. WebP/JPEG             ~ line 287.
+                          compression.                   _grab_dxcam(), _grab_mss()
+                                                         ~ lines 264, 276.
+                                                         Color rendering dxcam: issue
+                                                         in _grab_dxcam() RGB->array.
+
+def _screenshot(self, p)  SCREENSHOT command. Reads      ~ line 714. Change response
+                          quality, fmt, capturer         format or add capture
+                          from payload.                  parameters.
+
+def _stream_start(self,p) Screen capture stream.         ~ line 725. FPS:
+                          Cap ~30 FPS via time.sleep.    time.sleep(max(0,
+                                                         0.033-elapsed)).
+                                                         Parallel capture:
+                                                         asyncio.Queue(maxsize=1)
+                                                         here.
+
+def _dispatch(self, msg)  Router of all commands by      ~ line 473. Add a command:
+                          MsgType. Dict type -> method.  1) MsgType in
+                                                         common/protocol.py
+                                                         2) method _my_cmd()
+                                                         3) entry in _dispatch dict.
+
+def _cmd(self, p)         Executes shell. Decodes        ~ line 483. Encoding:
+                          CP866 on Windows.              .decode('cp866',
+                                                         errors='replace').
+
+def _file_download /      File transfer in chunks.       ~ line 500+. Data in agent
+    _upload               Protocol                       RAM. Large files (>1GB):
+                          CHUNK_BEGIN/DATA/END.          add streaming.
+
+--------------------------------------------------------------------------------
+server/relay_agent.py — agent WebSocket client
+--------------------------------------------------------------------------------
+
+File / Class              What it does                  Where to look when editing
+---------------------------------------------------------------------------
+_relay_session()          Single WS session to relay.   ~ line 30+. Binary stream:
+                          Authentication on local TCP.   block 'if conn_type == scr'.
+                          Proxying.                      Format: [req_id:16 bytes]
+                                                         [W:4][H:4][fmt:1][img bytes].
+
+from_relay() (async)      Loop: envelope from relay ->  ~ line 81+. Envelope:
+                          TCP -> response -> relay.      {req_id, payload}.
+                                                         Response: {req_id, response}
+                                                         or bytes.
+
+start_relay_client()      Entry point. asyncio.gather   ~ line 140+. Add new channel
+                          for three channels:            (audio, etc.) here.
+                          cmd, scr, file.
+
+_read_tcp_msg() /         Reads message from TCP:       ~ lines 116, 124. Protocol =
+_recv_exact()             4-byte big-endian length      common/protocol.py
+                          + body.                       send_msg/recv_msg.
+
+--------------------------------------------------------------------------------
+relay/main.py — server on Render (FastAPI + Flask)
+--------------------------------------------------------------------------------
+
+File / Class              What it does                  Where to look when editing
+---------------------------------------------------------------------------
+class AgentRegistry       Stores WS connections of      ~ line 35+. list_agents() ->
+                          agents. agent_id ->            /api/agents. get_ws(id, type)
+                          {cmd, scr, file}.              used in ws_stream and
+                                                         _relay_call_sync.
+
+ws_agent() @websocket     Agent endpoint:               ~ line 86+. Binary:
+                          /ws/agent/{id}/{type}.         bytes[:16]=req_id,
+                          Text and binary frames.        [16:]=data. Text: JSON
+                                                         {req_id, response}.
+
+ws_stream() @websocket    Browser stream:               ~ line 188+. Vars: quality,
+                          /ws/stream/{id}.               capturer. _recv_settings()
+                          Loop: request -> agent ->      in background. Format to
+                          browser.                       browser: [W:4][H:4][fmt:1]
+                                                         [img bytes].
+
+_relay_call_sync()        Synchronous call from Flask   ~ line 295+. IMPORTANT: only
+                          via                            this method, not
+                          asyncio.run_coroutine_         requests.get(localhost) ->
+                          threadsafe.                    deadlock. _main_loop:
+                                                         @app.on_event('startup').
+
+_build_payload()          Mapping method_name ->        ~ line 390+. Lambda is
+                          (MsgType, payload). Lambda     REQUIRED: otherwise
+                          for lazy evaluation.           base64.b64encode computed
+                                                         for all methods -> TypeError.
+                                                         New command: lambda entry
+                                                         here.
+
+flask_app routes          All /api/* operator routes.  ~ line 450+. _aid() extracts
+                          X-Agent-Id header.             agent_id. Each route:
+                                                         aid=_aid() -> if not aid:
+                                                         400 -> _conns(aid) -> call().
+
+--------------------------------------------------------------------------------
+server/web.py — Flask application
+--------------------------------------------------------------------------------
+
+File / Class              What it does                  Where to look when editing
+---------------------------------------------------------------------------
+class AgentConn           Direct TCP connection to      ~ line 104. Direct mode
+                          agent. Auto-reconnect, lock.   (--web, without relay).
+                                                         file timeout=600s.
+
+class RelayAgentConn      Proxy via relay. HTTP POST -> ~ line 157+. _build_payload()
+                          _relay_call_sync.              mapping. Relay mode.
+
+create_app()              Flask for direct TCP.         ~ line 262+. api_screenshot
+                          All /api/* routes.             ~ line 540: passes capturer=
+                                                         from query.
+
+create_relay_app()        Flask built into relay.       ~ line 850+. Second set of
+                          Uses RelayAgentConn.           routes. api_screenshot
+                                                         ~ line 908.
+
+--------------------------------------------------------------------------------
+templates/index.html — all operator UI
+--------------------------------------------------------------------------------
+
+File / Class              What it does                  Where to look when editing
+---------------------------------------------------------------------------
+_detectRelayMode()        On load: GET /api/agents.     ~ line 403. Auto-select single
+                          If response -> agent panel.    agent. setInterval(
+                                                         _refreshAgents, 5000).
+
+_agentHeaders(extra)      Adds X-Agent-Id to all        ~ line 359. Used in apiGet,
+                          fetch requests.                apiPost, apiPostForm. Direct
+                                                         fetch() calls must also call
+                                                         _agentHeaders.
+
+_startRelayStream()       WebSocket to                  ~ line 970+. onmessage:
+                          /ws/stream/{id}. Binary        Blob -> ArrayBuffer ->
+                          frames from relay.             DataView. [W:4][H:4][fmt:1]
+                                                         [img]. Quality and capturer
+                                                         -> _streamWs.send(JSON).
+
+streamLoop()              HTTP screenshot polling        ~ line 933. GET
+                          (direct mode). In relay        /api/screenshot?quality=
+                          mode: break.                   X&capturer=Y. FPS slider
+                                                         NOT connected to delay (bug).
+
+showFrame(r)              Draws frame on canvas.        ~ line 907.
+                          Supports fmt: webp/jpeg.       data:image/{fmt};base64,...
+                                                         New format: change mime.
+
+#tab-screen (HTML)        Stream controls: quality,     ~ line 222. #capturerSel -
+                          FPS, capturer, snapshot,       capturer selector.
+                          stream button.                 #fpsRange - NOT connected.
+
+#tab-terminal (HTML)      Command input,                Look for: id=termIn, termOut.
+                          stdout/stderr. Enter sends.    POST /api/cmd. Up/Down
+                                                         history not implemented.
+
+#tab-files (HTML)         File manager: list, upload,   loadFiles(), uploadFile(),
+                          download, archive, delete.     downloadFile().
+                                                         Progress: pollProgress(uid).
+
+#tab-processes (HTML)     Process list with sorting.    renderProcs(),
+                          Kill by PID.                   setProcSort(col). Sorting:
+                                                         _procSort, _procDir.
+
+--------------------------------------------------------------------------------
+common/protocol.py and common/crypto.py
+--------------------------------------------------------------------------------
+
+File / Class              What it does                  Where to look when editing
+---------------------------------------------------------------------------
+class MsgType             All message types. Str-enum:  Add command: 1) entry here
+(str, Enum)               value = command string.        2) handler in
+                                                         handler._dispatch
+                                                         3) lambda in relay/main.py
+                                                         _build_payload.
+
+send_msg() / recv_msg()   Protocol: 4-byte big-endian   Change carefully: both sides
+                          length + JSON body.            must match (agent +
+                                                         relay_agent).
+
+hash_password() /         bcrypt hashing. Sliding       Rate limiting only on
+RateLimiter               window login attempts.         Flask login. TCP handler.py
+                                                         NOT protected.
+
+
+================================================================================
+3. STATUS OF IMPLEMENTED FEATURES
+================================================================================
+
+Feature                              Status       Notes
+---------------------------------------------------------------------------
+Screen stream (WebSocket, WebP,      WORKING      ws_stream in relay/main.py.
+binary)                                           Binary frame [W][H][fmt][img].
+
+Screenshot (dxcam/mss, WebP/JPEG)   WORKING      grabScreen() -> GET
+                                                  /api/screenshot?quality=
+                                                  X&capturer=Y
+
+Capturer selection (dxcam / mss)    WORKING      #capturerSel in UI. Passed via
+                                                  capturer= in handler._screenshot.
+
+Terminal (shell commands)            WORKING      CP866 decoding on Windows.
+                                                  Command history not implemented.
+
+File manager                         WORKING      Progress bars with cancel.
+(upload/download/archive)                         Download buffered in relay RAM.
+
+Mouse control                        WORKING      Click, double, right, scroll,
+                                                  drag. ctypes SendInput Windows.
+
+Keyboard and hotkeys                 WORKING      key_press, key_hotkey, key_type.
+                                                  pyautogui + ctypes.
+
+Clipboard                            WORKING      Read and write via pyperclip.
+
+Processes (list + Kill)              WORKING      Sort by CPU/RAM/PID/name. psutil.
+
+Dashboard (CPU/RAM/disk/OS)          WORKING      GET /api/sysinfo. Updates on
+                                                  tab switch.
+
+Agent selection in relay mode        WORKING      _detectRelayMode() -> agent panel.
+                                                  Auto-refresh every 5s.
+
+Authentication (bcrypt + sessions)   WORKING      SESSION_VERSION=1 invalidates old
+                                                  sessions. Duration: 24h.
+
+FPS slider (#fpsRange)               NOT WORKING  Value read from DOM but not passed
+                                                  to stream logic.
+
+Terminal history (up/down arrows)    NOT          Command array and arrow navigation
+                                     IMPLEMENTED  not present.
+
+Rate limiting on TCP agent           ABSENT       Only Flask login protected.
+                                                  handler._authenticate() has no
+                                                  limits.
+
+Large file download (>500MB)         PARTIAL      Full file in relay RAM. OOM risk.
+                                                  Streaming needed.
+
+Agent disconnect notification        PARTIAL      Disappears from list after 5s
+                                                  polling. No instant signal.
+
+
+================================================================================
+4. LAUNCH
+================================================================================
+
+Agent
+-----
+  python -m server.main --port 9999 --password MyPassword12 \
+    --relay https://your-relay.onrender.com --agent-id MyPC
+
+Relay (Render.com)
+------------------
+  Build:  pip install -r relay/requirements.txt
+  Start:  python -m uvicorn relay.main:app --host 0.0.0.0 --port $PORT
+  Env:    OPERATOR_PASSWORD = YourOperatorPassword12
+
+Agent Dependencies
+------------------
+  psutil  Pillow  mss  pyautogui  pyperclip  pynput  bcrypt  websockets
+  dxcam (Windows only, optional)
+
+What to upload to GitHub (for Render)
+--------------------------------------
+  relay/main.py, relay/requirements.txt, relay/render.yaml
+  templates/index.html, templates/login.html
+  common/protocol.py, common/crypto.py, common/__init__.py
+  server/__init__.py (empty file)
+
+Local only (on agent machine)
+------------------------------
+  server/handler.py, server/main.py, server/relay_agent.py, server/web.py
+
+
+================================================================================
+5. PRIORITY IMPROVEMENT PLAN
+================================================================================
+
+Level 1 — Obvious Bugs
+------------------------
+• FPS slider — pass #fpsRange value to inter-frame delay.
+  Files: index.html (_startRelayStream, oninput),
+         relay/main.py (sleep in ws_stream).
+
+• Agent disconnect notification — in registry.unregister() send a push event
+  to the browser via SSE or a dedicated WS.
+  File: relay/main.py.
+
+• Terminal history — array lastCmds[], onkeydown arrow keys.
+  File: index.html (#tab-terminal block).
+
+Level 2 — Stream Improvements
+-------------------------------
+• Parallel capture — in relay_agent.py capture next frame while relay delivers
+  the current one. asyncio.Queue(maxsize=1).
+  File: server/relay_agent.py.
+
+• Adaptive quality — RTT of each frame in ws_stream, automatic quality
+  adjustment.
+  File: relay/main.py.
+
+• Multi-monitor support — monitor_idx parameter in _Capturer.grab().
+  Files: server/handler.py, relay/main.py (_build_payload), index.html.
+
+Level 3 — Security
+--------------------
+• Rate limiting on TCP — in handler._authenticate() counter by IP.
+  Use RateLimiter from common/crypto.py.
+  File: server/handler.py.
+
+• Auto-reconnect with backoff — replace fixed 5s with 5->10->30->60s.
+  File: server/relay_agent.py (_conn_loop).
+
+Level 4 — New Features
+------------------------
+• Audio stream — soundcard/pyaudio on agent, Opus, Web Audio API.
+  New MsgType.AUDIO in protocol.py, handler in handler.py,
+  /ws/audio/{id} in relay/main.py.
+
+• Download without buffering — chunked streaming via Flask generator.
+  Files: relay/main.py (api_files_download), server/web.py.
+
+• Drag-and-drop to screen — drop handler on #ov in index.html,
+  POST /api/files/upload with current directory path.
+
+--------------------------------------------------------------------------------
+Note: Line numbers are approximate — use function and class name search.
+--------------------------------------------------------------------------------
