@@ -4,7 +4,6 @@ Flask-приложение Relay для оператора.
 """
 
 import base64, io, os, sys, threading, time, uuid as _uuid_mod
-from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -12,10 +11,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from flask import (Flask, render_template, request, jsonify,
                    session, redirect, url_for, send_file, abort)
 from flask_sock import Sock
-from common.crypto import check_password, hash_password, get_or_create_secret_key
+from common.crypto import (check_password, hash_password, get_or_create_secret_key,
+                            RateLimiter)
 from relay.registry import registry
 from relay.conn import RelayAgentConn
 from relay.agent_ws import handle_agent_ws
+
+
+def _safe_path(p):
+    if not p or not isinstance(p, str): return False
+    if "\x00" in p or len(p) > 4096: return False
+    return True
 
 
 def create_relay_app(password: str) -> Flask:
@@ -34,15 +40,32 @@ def create_relay_app(password: str) -> Flask:
     pwd_hash = hash_password(password)
 
     SESSION_VERSION = 1
-    _login_attempts: dict = defaultdict(list)
+    _login_limiter  = RateLimiter(max_attempts=5, window_sec=300)
     _transfer_progress: dict = {}
+    _progress_lock = threading.Lock()
+
+    PROGRESS_TTL_SEC = 10 * 60
+
+    def _progress_gc():
+        while True:
+            time.sleep(60)
+            try:
+                now = time.time()
+                with _progress_lock:
+                    stale = [uid for uid, p in _transfer_progress.items()
+                             if (now - p.get("created_at", now) > PROGRESS_TTL_SEC)
+                             and (p.get("done") or p.get("error") or p.get("cancelled"))]
+                    for uid in stale:
+                        _transfer_progress.pop(uid, None)
+            except Exception:
+                pass
+    threading.Thread(target=_progress_gc, daemon=True).start()
 
     # ── WebSocket endpoint для агентов ────────────────────────────────── #
     @sock.route('/ws/agent')
     def ws_agent(ws):
         handle_agent_ws(ws, pwd_hash)
 
-    # ── Security headers ──────────────────────────────────────────────── #
     @app.after_request
     def security_headers(resp):
         resp.headers['X-Content-Type-Options'] = 'nosniff'
@@ -53,7 +76,6 @@ def create_relay_app(password: str) -> Flask:
         )
         return resp
 
-    # ── Auth helpers ──────────────────────────────────────────────────── #
     def _is_auth():
         return (session.get("auth") and
                 session.get("v") == SESSION_VERSION and
@@ -68,7 +90,9 @@ def create_relay_app(password: str) -> Flask:
             return fn(*a, **kw)
         return wrapper
 
-    # ── Login ─────────────────────────────────────────────────────────── #
+    def check_path(p):
+        if not _safe_path(p): abort(400, description="Invalid path")
+
     @app.route("/")
     def index():
         if not _is_auth(): return redirect(url_for("login"))
@@ -78,21 +102,24 @@ def create_relay_app(password: str) -> Flask:
     def login():
         ip = request.remote_addr or "unknown"
         if request.method == "POST":
-            now = time.time()
-            _login_attempts[ip] = [t for t in _login_attempts[ip] if now-t < 300]
-            if len(_login_attempts[ip]) >= 5:
-                return render_template("login.html", error="Слишком много попыток. Подождите 5 мин.")
+            blocked, wait = _login_limiter.is_blocked(ip)
+            if blocked:
+                return render_template("login.html",
+                    error=f"Слишком много попыток. Подождите {(wait+59)//60} мин.")
             if check_password(request.form.get("password",""), pwd_hash):
                 session.clear()
                 session["auth"]    = True
                 session["v"]       = SESSION_VERSION
                 session["created"] = int(time.time())
                 session.permanent  = True
-                _login_attempts[ip].clear()
+                # Намеренно не сбрасываем счётчик: иначе атакующий со
+                # знанием одного пароля мог бы обнулять блокировку IP.
                 return redirect(url_for("index"))
-            _login_attempts[ip].append(now)
-            remaining = max(0, 5 - len(_login_attempts[ip]))
-            return render_template("login.html", error=f"Неверный пароль. Осталось попыток: {remaining}")
+            _login_limiter.record_failure(ip)
+            remaining = max(0, _login_limiter.max_attempts -
+                            len(_login_limiter._attempts.get(ip, [])))
+            return render_template("login.html",
+                error=f"Неверный пароль. Осталось попыток: {remaining}")
         return render_template("login.html", error=None)
 
     @app.route("/logout")
@@ -100,7 +127,6 @@ def create_relay_app(password: str) -> Flask:
         session.clear()
         return redirect(url_for("login"))
 
-    # ── Агенты ────────────────────────────────────────────────────────── #
     @app.route("/api/agents")
     @require_auth
     def api_agents():
@@ -119,13 +145,13 @@ def create_relay_app(password: str) -> Flask:
         session["agent_id"] = agent_id
         return jsonify({"ok": True, "agent_id": agent_id})
 
-    # ── AgentConn factory ─────────────────────────────────────────────── #
-    def _conn(label="cmd", timeout=120):
-        return RelayAgentConn(label=label, timeout=timeout)
-
-    # ── Все остальные API-маршруты ────────────────────────────────────── #
-    # Ниже — полная копия роутов из server/web.py, но вместо cmd_conn/file_conn
-    # используется _conn() который читает agent_id из сессии.
+    def _conn(label="cmd", timeout=120, agent_id=None):
+        """
+        AgentConn-замена. При вызове из вью-функции agent_id может быть None —
+        тогда RelayAgentConn возьмёт его из session. Для фоновых потоков
+        (без request context) ОБЯЗАТЕЛЬНО передавайте agent_id явно.
+        """
+        return RelayAgentConn(label=label, timeout=timeout, agent_id=agent_id)
 
     @app.route("/api/path/parent")
     @require_auth
@@ -166,6 +192,7 @@ def create_relay_app(password: str) -> Flask:
     def api_files():
         try:
             path = request.args.get("path","")
+            if path: check_path(path)
             r = _conn().call("file_list", path)
             return jsonify(r.get("payload", {}))
         except Exception as e:
@@ -180,6 +207,7 @@ def create_relay_app(password: str) -> Flask:
             if not f: return jsonify({"error": "no file"}), 400
             remote_path = request.form.get("path","")
             if not remote_path: return jsonify({"error": "no path"}), 400
+            check_path(remote_path)
             data = f.read()
             uid  = str(_uuid_mod.uuid4())
 
@@ -187,34 +215,43 @@ def create_relay_app(password: str) -> Flask:
                 r = _conn().call("upload_bytes", remote_path, data)
                 if r.get("type") == "error":
                     return jsonify({"error": r["payload"].get("reason","upload failed")}), 500
-                _transfer_progress[uid] = {"sent": len(data), "total": len(data), "done": True, "error": None}
+                _transfer_progress[uid] = {"sent": len(data), "total": len(data),
+                                           "done": True, "error": None,
+                                           "created_at": time.time()}
                 return jsonify({"upload_id": uid, "done": True})
 
-            _transfer_progress[uid] = {"sent": 0, "total": len(data), "done": False, "error": None, "cancelled": False}
+            _transfer_progress[uid] = {"sent": 0, "total": len(data), "done": False,
+                                       "error": None, "cancelled": False,
+                                       "created_at": time.time()}
+            # Захватываем agent_id СЕЙЧАС, пока есть request context. В _run()
+            # context уже отсутствует — session.get там вернёт None.
             agent_id = session.get("agent_id")
 
             def _run():
-                def cb(sent, total):
-                    if _transfer_progress.get(uid,{}).get("cancelled"):
-                        raise InterruptedError("cancelled")
-                    _transfer_progress[uid]["sent"] = sent
                 try:
-                    r = RelayAgentConn(timeout=600).call.__func__(
-                        RelayAgentConn(timeout=600), "upload_bytes_chunked", remote_path, data, cb)
-                    if not _transfer_progress.get(uid,{}).get("cancelled"):
-                        if r.get("type") == "error":
-                            _transfer_progress[uid]["error"] = r["payload"].get("reason","failed")
-                        else:
-                            _transfer_progress[uid]["sent"] = len(data)
-                            _transfer_progress[uid]["done"] = True
+                    def cb(sent, total):
+                        if _transfer_progress.get(uid,{}).get("cancelled"):
+                            raise InterruptedError("cancelled")
+                        _transfer_progress[uid]["sent"] = sent
+                    def is_cancelled():
+                        return bool(_transfer_progress.get(uid,{}).get("cancelled"))
+
+                    # Передаём agent_id явно — в потоке нет Flask context.
+                    conn = RelayAgentConn(timeout=600, agent_id=agent_id)
+                    r = conn.call("upload_bytes_chunked", remote_path, data,
+                                  progress_cb=cb, cancelled_fn=is_cancelled)
+                    if _transfer_progress.get(uid,{}).get("cancelled"):
+                        return
+                    if isinstance(r, dict) and r.get("type") == "error":
+                        _transfer_progress[uid]["error"] = r["payload"].get("reason","failed")
+                    else:
+                        _transfer_progress[uid]["sent"] = len(data)
+                        _transfer_progress[uid]["done"] = True
                 except InterruptedError:
                     pass
                 except Exception as e:
                     _transfer_progress[uid]["error"] = str(e)
 
-            # Привязываем agent_id к потоку через app_context
-            @app.context_processor
-            def _inject(): return {}
             threading.Thread(target=_run, daemon=True).start()
             return jsonify({"upload_id": uid, "done": False, "total": len(data)})
         except Exception as e:
@@ -226,12 +263,13 @@ def create_relay_app(password: str) -> Flask:
         try:
             remote_path = request.args.get("path","")
             if not remote_path: return jsonify({"error": "no path"}), 400
+            check_path(remote_path)
             uid   = str(_uuid_mod.uuid4())
             fname = remote_path.replace("\\","/").split("/")[-1] or "file"
-            print(f"[relay/web][download] start uid={uid} path={remote_path}")
             _transfer_progress[uid] = {"received": 0, "total": 0, "done": False,
-                                       "error": None, "cancelled": False, "fname": fname}
-            conn = _conn("file", timeout=600)
+                                       "error": None, "cancelled": False, "fname": fname,
+                                       "created_at": time.time()}
+            agent_id = session.get("agent_id")
             def _run():
                 try:
                     def cb(recv, total):
@@ -239,28 +277,26 @@ def create_relay_app(password: str) -> Flask:
                             raise InterruptedError("cancelled")
                         _transfer_progress[uid]["received"] = recv
                         _transfer_progress[uid]["total"]    = total
+                    conn = RelayAgentConn(label="file", timeout=600, agent_id=agent_id)
                     r = conn.call("download_bytes_with_progress", remote_path, cb)
                     if isinstance(r, bytes):
                         _transfer_progress[uid].update({
                             "data": r, "received": len(r), "total": len(r), "done": True
                         })
                         return
-                    data = r.get("payload", {}).get("data")
+                    data = r.get("payload", {}).get("data") if isinstance(r, dict) else None
                     if data:
-                        import base64 as b64
-                        decoded = b64.b64decode(data)
+                        decoded = base64.b64decode(data)
                         _transfer_progress[uid].update({
                             "data": decoded, "received": len(decoded), "total": len(decoded), "done": True
                         })
                     else:
-                        _transfer_progress[uid]["error"] = r.get("payload",{}).get("reason","no data")
-                        print(f"[relay/web][download] uid={uid} error={_transfer_progress[uid]['error']}")
+                        _transfer_progress[uid]["error"] = (r.get("payload",{}).get("reason","no data")
+                                                            if isinstance(r, dict) else "no data")
                 except InterruptedError:
-                    print(f"[relay/web][download] uid={uid} cancelled")
                     pass
                 except Exception as e:
                     _transfer_progress[uid]["error"] = str(e)
-                    print(f"[relay/web][download] uid={uid} exception={e}")
             threading.Thread(target=_run, daemon=True).start()
             return jsonify({"download_id": uid})
         except Exception as e:
@@ -281,7 +317,7 @@ def create_relay_app(password: str) -> Flask:
     def api_progress(uid):
         prog = _transfer_progress.get(uid)
         if not prog: return jsonify({"error": "unknown id"}), 404
-        return jsonify({k:v for k,v in prog.items() if k not in ("data",)})
+        return jsonify({k:v for k,v in prog.items() if k != "data"})
 
     @app.route("/api/files/cancel", methods=["POST"])
     @require_auth
@@ -296,6 +332,7 @@ def create_relay_app(password: str) -> Flask:
     def api_delete():
         try:
             path = (request.json or {}).get("path","")
+            check_path(path)
             r = _conn().call("file_delete", path)
             if r.get("type") == "error":
                 return jsonify({"error": r["payload"].get("reason","error")}), 500
@@ -308,6 +345,7 @@ def create_relay_app(password: str) -> Flask:
     def api_mkdir():
         try:
             path = (request.json or {}).get("path","")
+            check_path(path)
             _conn().call("file_mkdir", path)
             return jsonify({"ok": True})
         except Exception as e:
@@ -318,6 +356,7 @@ def create_relay_app(password: str) -> Flask:
     def api_rename():
         try:
             d = request.json or {}
+            check_path(d.get("src","")); check_path(d.get("dst",""))
             _conn().call("file_rename", d.get("src",""), d.get("dst",""))
             return jsonify({"ok": True})
         except Exception as e:
@@ -343,10 +382,10 @@ def create_relay_app(password: str) -> Flask:
             paths = d.get("paths",[])
             name  = d.get("name","archive.zip")
             uid   = str(_uuid_mod.uuid4())
-            print(f"[relay/web][zip-download] start uid={uid} entries={len(paths)} name={name}")
             _transfer_progress[uid] = {"received": 0, "total": 0, "done": False,
-                                       "error": None, "fname": name, "cancelled": False}
-            conn = _conn("file", timeout=600)
+                                       "error": None, "fname": name, "cancelled": False,
+                                       "created_at": time.time()}
+            agent_id = session.get("agent_id")
             def _run():
                 try:
                     def cb(recv, total):
@@ -354,28 +393,26 @@ def create_relay_app(password: str) -> Flask:
                             raise InterruptedError("cancelled")
                         _transfer_progress[uid]["received"] = recv
                         _transfer_progress[uid]["total"]    = total
+                    conn = RelayAgentConn(label="file", timeout=600, agent_id=agent_id)
                     r = conn.call("download_zip", paths, cb)
                     if isinstance(r, bytes):
                         _transfer_progress[uid].update({
                             "data": r, "received": len(r), "total": len(r), "done": True
                         })
                         return
-                    data = r.get("payload",{}).get("data")
+                    data = r.get("payload",{}).get("data") if isinstance(r, dict) else None
                     if data:
-                        import base64 as b64
-                        decoded = b64.b64decode(data)
+                        decoded = base64.b64decode(data)
                         _transfer_progress[uid].update({
                             "data": decoded, "received": len(decoded), "total": len(decoded), "done": True
                         })
                     else:
-                        _transfer_progress[uid]["error"] = r.get("payload",{}).get("reason","failed")
-                        print(f"[relay/web][zip-download] uid={uid} error={_transfer_progress[uid]['error']}")
+                        _transfer_progress[uid]["error"] = (r.get("payload",{}).get("reason","failed")
+                                                            if isinstance(r, dict) else "failed")
                 except InterruptedError:
-                    print(f"[relay/web][zip-download] uid={uid} cancelled")
                     pass
                 except Exception as e:
                     _transfer_progress[uid]["error"] = str(e)
-                    print(f"[relay/web][zip-download] uid={uid} exception={e}")
             threading.Thread(target=_run, daemon=True).start()
             return jsonify({"download_id": uid})
         except Exception as e:

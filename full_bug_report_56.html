@@ -1,0 +1,162 @@
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font-sans);font-size:14px}
+.top{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;padding-top:12px}
+.pill{display:flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;font-size:13px;font-weight:500;border:1px solid var(--color-border-tertiary);cursor:pointer;transition:all .15s}
+.pill.active,.pill:hover{border-color:var(--color-border-primary)}
+.pill.active{background:var(--color-background-tertiary)}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dc{background:#E24B4A}.dh{background:#EF9F27}.dm{background:#378ADD}.dl{background:#888780}
+.section-lbl{font-size:11px;font-weight:500;color:var(--color-text-secondary);text-transform:uppercase;letter-spacing:.7px;margin:14px 0 6px;padding-bottom:5px;border-bottom:1px solid var(--color-border-tertiary)}
+.bug{display:flex;gap:10px;padding:10px 12px;border-radius:8px;margin-bottom:5px;border:1px solid var(--color-border-tertiary);background:var(--color-background-secondary);cursor:pointer;transition:border-color .15s}
+.bug:hover{border-color:var(--color-border-secondary)}
+.bug.open{border-color:var(--color-border-primary)}
+.bar{flex-shrink:0;width:4px;border-radius:2px;align-self:stretch;min-height:18px}
+.bc{background:#E24B4A}.bh{background:#EF9F27}.bm{background:#378ADD}.bl{background:#888780}
+.bdy{flex:1;min-width:0}
+.hd{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap}
+.tt{font-size:13px;font-weight:500;color:var(--color-text-primary)}
+.tg{font-size:11px;padding:1px 6px;border-radius:10px;font-weight:500;flex-shrink:0}
+.tgc{background:#FCEBEB;color:#A32D2D}.tgh{background:#FAEEDA;color:#854F0B}
+.tgm{background:#E6F1FB;color:#185FA5}.tgl{background:#F1EFE8;color:#5F5E5A}
+@media(prefers-color-scheme:dark){
+.tgc{background:#501313;color:#F7C1C1}.tgh{background:#412402;color:#FAC775}
+.tgm{background:#042C53;color:#B5D4F4}.tgl{background:#2C2C2A;color:#B4B2A9}}
+.fb{font-size:11px;font-family:var(--font-mono);color:var(--color-text-tertiary);background:var(--color-background-tertiary);padding:1px 5px;border-radius:4px}
+.ds{font-size:12px;color:var(--color-text-secondary);margin-top:3px;line-height:1.5}
+.dt{display:none;margin-top:8px;padding:9px 11px;background:var(--color-background-tertiary);border-radius:6px;font-size:11px;color:var(--color-text-secondary);font-family:var(--font-mono);white-space:pre-wrap;word-break:break-word;line-height:1.6}
+.dt.show{display:block}
+#search{width:100%;padding:7px 12px;background:var(--color-background-secondary);border:1px solid var(--color-border-tertiary);border-radius:8px;color:var(--color-text-primary);font-size:13px;outline:none;margin-bottom:12px}
+#search:focus{border-color:var(--color-border-secondary)}
+#count{font-size:12px;color:var(--color-text-tertiary);margin-bottom:8px}
+</style>
+
+<div style="padding-top:12px">
+<div class="top">
+  <div class="pill active" data-f="all" onclick="filter('all',this)"><span style="font-size:12px">все</span><span style="color:var(--color-text-secondary);font-size:12px" id="cnt-all">56</span></div>
+  <div class="pill" data-f="crit" onclick="filter('crit',this)"><div class="dot dc"></div><span>критических</span><span style="color:var(--color-text-secondary);font-size:12px" id="cnt-crit">3</span></div>
+  <div class="pill" data-f="high" onclick="filter('high',this)"><div class="dot dh"></div><span>высоких</span><span style="color:var(--color-text-secondary);font-size:12px" id="cnt-high">21</span></div>
+  <div class="pill" data-f="med" onclick="filter('med',this)"><div class="dot dm"></div><span>средних</span><span style="color:var(--color-text-secondary);font-size:12px" id="cnt-med">21</span></div>
+  <div class="pill" data-f="low" onclick="filter('low',this)"><div class="dot dl"></div><span>низких</span><span style="color:var(--color-text-secondary);font-size:12px" id="cnt-low">11</span></div>
+</div>
+<input id="search" placeholder="🔍 поиск по названию, файлу..." oninput="render()">
+<div id="count"></div>
+<div id="list"></div>
+</div>
+
+<script>
+const BUGS=[
+  {s:'crit',f:'server/handler.py',t:'Path traversal: все файловые операции без валидации',d:'_file_download, _file_upload, _file_delete принимают путь напрямую без проверки. Оператор может читать /etc/passwd, SSH-ключи, удалить системные файлы.',c:'def _file_download(self, p):\n    path = p["path"]\n    data = Path(path).read_bytes()  # /etc/passwd — OK\n\ndef _file_delete(self, p):\n    shutil.rmtree(t) if t.is_dir() else t.unlink()  # rm -rf /'},
+  {s:'crit',f:'server/handler.py',t:'Нет rate limiting в _authenticate — брутфорс пароля',d:'TCP-сервер принимает неограниченное число попыток. RateLimiter из common/crypto.py не используется. Только Flask-логин защищён.',c:'def _authenticate(self):\n    msg = recv_msg(self.conn)\n    if check_password(msg["payload"].get("password",""), self.password_hash):\n        ...\n    # Нет счётчика попыток по IP\n    # RateLimiter уже есть в common/crypto.py — не используется'},
+  {s:'crit',f:'relay/main.py',t:'OOM: весь файл буферизуется в _progress[uid]["data"]',d:'При скачивании файл целиком хранится в dict в памяти Render (512MB free tier). Файл 500MB+ убьёт процесс. io.BytesIO в send_file создаёт вторую копию.',c:'_progress[uid].update({"data": data})  # весь файл в RAM\n# /api/files/dl/<uid>:\nreturn send_file(io.BytesIO(data), ...)  # ещё одна копия!'},
+  {s:'high',f:'common/protocol.py',t:'send_msg не атомарен: header+partial body при обрыве',d:'Конкатенация header+body — лишняя аллокация. При BrokenPipeError после отправки header получатель зависнет в _exact() ожидая N байт которые не придут.',c:'def send_msg(sock, msg_type, payload):\n    data = json.dumps({...}).encode()\n    sock.sendall(struct.pack(">I", len(data)) + data)\n    # При обрыве посередине: header отправлен, тело — нет\n    # recv_msg будет ждать N байт бесконечно'},
+  {s:'high',f:'server/handler.py',t:'_dchunk_send читает весь файл в память перед отправкой',d:'Path(path).read_bytes() загружает весь файл в RAM. Потом создаётся список chunks — ещё одна копия. Для 4GB файла это 8GB RAM.',c:'def _dchunk_send(self, path):\n    data = Path(path).read_bytes()  # весь файл в RAM!\n    chunks = [data[i:i+CHUNK_SIZE] for i in range(...)]  # ещё копия\n    # Нужен: with open(path,"rb") as f: f.read(CHUNK_SIZE)'},
+  {s:'high',f:'server/handler.py',t:'_file_zip_stream: circular symlinks → бесконечный цикл',d:'path.rglob("*") обходит дерево без ограничения глубины. На Linux симлинки могут создавать бесконечные циклы. Нет follow_symlinks=False.',c:'for sub in path.rglob("*"):  # бесконечный цикл при symlink loop\n    if sub.is_file():\n        zf.write(sub, ...)  # ZIP растёт бесконечно'},
+  {s:'high',f:'server/handler.py',t:'_cmd: subprocess.run блокирует поток на 60 сек',d:'Синхронный вызов блокирует ClientHandler thread на timeout=60 сек. В relay-режиме весь cmd-канал недоступен — нельзя остановить стрим, отправить Ctrl+C.',c:'r = subprocess.run(command, shell=True, timeout=60, ...)\n# Поток заблокирован 60 сек\n# Стрим нельзя остановить, мышь/клавиши не работают'},
+  {s:'high',f:'server/handler.py',t:'_grab_dxcam: start() без stop() при исключении',d:'При ошибке get_latest_frame() — stop() не вызывается. Камера остаётся в state=running. Следующий start() падает с ошибкой dxcam.',c:'cls._dxcam.start(target_fps=60, video_mode=True)\nframe = cls._dxcam.get_latest_frame()  # может бросить!\ncls._dxcam.stop()  # не выполнится\n# Нужно: try/finally'},
+  {s:'high',f:'server/relay_agent.py',t:'from_relay: ошибка одного запроса убивает весь WS-канал',d:'При исключении в обработке сообщения отправляется error-ответ. Если ws.send() при отправке ошибки тоже падает — исключение поднимается в async for → закрывает весь канал.',c:'async for raw_msg in ws:\n    try:\n        ...\n    except Exception as e:\n        try:\n            await ws.send(json.dumps({...error...}))\n        except Exception:\n            pass  # если send упал — async for получит исключение → канал закрыт'},
+  {s:'high',f:'server/relay_agent.py',t:'Фиксированная задержка 5 сек — нет exponential backoff',d:'RECONNECT_DELAY = 5 всегда. При network storm все агенты одновременно переподключаются каждые 5 сек, создавая нагрузку на relay.',c:'RECONNECT_DELAY = 5  # константа\nawait asyncio.sleep(RECONNECT_DELAY)\n# Нужно: min(5 * 2**attempt, 60)'},
+  {s:'high',f:'relay/main.py',t:'ping() всегда возвращает ok=True (operator precedence)',d:'"X or True" всегда True. Пинг никогда не сообщает об ошибке в relay/web.py.',c:'ok = cmd.call("ping") == {"type": "pong", "payload": {}} or True\n#                                                            ^^^^^^^\n# Всегда True\nreturn jsonify({"ok": True, "agent_id": aid})  # никогда ok=False'},
+  {s:'high',f:'relay/main.py',t:'Race condition в AgentRegistry.register при reconnect',d:'old_ws закрывается вне лока. Между снятием лока и close() другой горутин может записать новый WS. В теории может закрыть активное соединение при быстром переподключении.',c:'async with self._lock:\n    old_ws = self._agents[agent_id].get(conn_type)\n    self._agents[agent_id][conn_type] = ws\n# ← лок снят, но old_ws ещё не закрыт\nif old_ws is not None and old_ws is not ws:\n    await old_ws.close(code=4001)'},
+  {s:'high',f:'relay/main.py',t:'_main_loop = None при старте — запросы до startup падают',d:'@app.on_event("startup") выполняется асинхронно. Render может направить трафик раньше. Все _relay_call_sync вернут {"error": "Relay not ready"}.',c:'_main_loop: asyncio.AbstractEventLoop = None\n\n@app.on_event("startup")\nasync def _capture_loop():\n    global _main_loop\n    _main_loop = asyncio.get_event_loop()  # ← может не сработать вовремя'},
+  {s:'high',f:'relay/main.py',t:'_relay_call_sync блокирует Flask thread на 125 сек',d:'fut.result(timeout=125) полностью блокирует Flask worker thread. При Render free tier (1 worker) сервер полностью недоступен на время ожидания.',c:'fut = asyncio.run_coroutine_threadsafe(_send(), _main_loop)\nreturn fut.result(timeout=timeout + 5)  # блокирует Flask thread 125 сек!\n# С Gunicorn workers=1 → весь сервер недоступен'},
+  {s:'high',f:'relay/main.py',t:'_pending_meta не очищается при TimeoutError в ws_stream',d:'asyncio.TimeoutError → _pending.pop(req_id) но не _pending_meta.pop(req_id). При медленном агенте каждый timeout = утечка записи.',c:'except asyncio.TimeoutError:\n    _pending.pop(req_id, None)\n    # ← забыто: _pending_meta.pop(req_id, None)'},
+  {s:'high',f:'relay/main.py',t:'Chunked upload через __func__ — сломан',d:'RelayAgentConn(timeout=600).call.__func__(RelayAgentConn(timeout=600), ...) создаёт два разных объекта без agent_id из сессии Flask.',c:'resp = RelayAgentConn(timeout=600).call.__func__(\n    RelayAgentConn(timeout=600), "upload_bytes_chunked", ...)\n# Оба объекта не имеют agent_id — "No agent selected"'},
+  {s:'high',f:'client/agent.py',t:'download_bytes буферизует весь файл в bytearray',d:'buf += base64.b64decode(chunk) — растёт до размера файла. bytes(buf) создаёт вторую копию. 4GB файл = 8GB RAM на клиенте.',c:'buf = bytearray()\nfor i in range(n):\n    buf += base64.b64decode(chunk_msg["payload"]["data"])  # растёт!\nreturn bytes(buf)  # ещё одна копия!'},
+  {s:'high',f:'templates/index.html',t:'FPS slider не передаётся агенту в прямом режиме',d:'В прямом (HTTP polling) режиме слайдер влияет на частоту запросов браузера, но не на частоту захвата на агенте. Агент всегда делает time.sleep(0.033) = 30fps.',c:'// Браузер учитывает FPS для задержки:\nawait new Promise(res => setTimeout(res, _streamDelayMs()));\n// Но агент: time.sleep(max(0, 0.033 - elapsed))  ← фиксировано!'},
+  {s:'high',f:'templates/index.html',t:'screenTypeSend перезаписывает clipboard агента',d:'Текст записывается в clipboard агента через /api/clipboard, потом Ctrl+V. Пользователь агента теряет буфер обмена. Нужно /api/keyboard/type.',c:'async function screenTypeSend() {\n  await apiPost("/api/clipboard", {text});  // затирает clipboard!\n  await apiPost("/api/keyboard/hotkey", {keys:["ctrl","v"]});\n  // Нужно: await apiPost("/api/keyboard/type", {text});\n}'},
+  {s:'high',f:'templates/index.html',t:'doType() на вкладке Keyboard тоже затирает clipboard',d:'Идентичная проблема: apiPost("/api/clipboard", {text}) перезаписывает буфер обмена агента без предупреждения.',c:'async function doType() {\n  const r1 = await apiPost("/api/clipboard", {text});  // затирает!\n  const r2 = await apiPost("/api/keyboard/hotkey", {keys:["ctrl","v"]});\n  // Нужно: apiPost("/api/keyboard/type", {text})\n}'},
+  {s:'high',f:'relay/registry.py',t:'send() под entry.lock → deadlock при полном буфере WS',d:'call() держит entry.lock пока выполняет ws.send(). Если буфер заполнен и send блокируется — lock удерживается. deliver() тоже пытается взять entry.lock → deadlock.',c:'def call(self, ...):\n    with entry.lock:\n        entry.ws.send(msg)  # блокируется при полном буфере → deadlock!\n\ndef deliver(self, ...):\n    with entry.lock:  # пытается взять тот же лок → deadlock'},
+  {s:'high',f:'relay/conn.py',t:'session.get("agent_id") недоступен в фоновых потоках',d:'RelayAgentConn.call читает agent_id из flask.session. В threading.Thread (upload/download _run()) Flask request context отсутствует → session недоступен → agent_id = None.',c:'def call(self, method, *args, **kwargs):\n    agent_id = session.get("agent_id")  # нет request context в потоке!\n    if not agent_id:\n        return {"type": "error", "reason": "No agent selected"}'},
+  {s:'high',f:'server/web.py',t:'RelayAgentConn HTTP к FastAPI — deadlock на Render',d:'server/web.py RelayAgentConn делает requests.post() к localhost FastAPI. Но FastAPI обёртывает Flask через WSGIMiddleware — HTTP запрос к себе создаёт deadlock.',c:'def call(self, method, *args, **kwargs):\n    r = self._get_session().post(url, ...)  # HTTP к FastAPI\n    # Flask → FastAPI → WSGIMiddleware → Flask → HTTP → deadlock'},
+  {s:'med',f:'common/protocol.py',t:'recv_msg не ограничивает размер — DoS/OOM',d:'n = struct.unpack(">I", raw)[0] — максимум 4GB. Злоумышленник с доступом к TCP отправляет header с n=2147483647 → _exact выделяет 2GB.',c:'def recv_msg(sock):\n    n = struct.unpack(">I", raw)[0]  # может быть 4GB!\n    return json.loads(_exact(sock, n).decode())  # OOM\n    # Нужно: if n > MAX_MSG_SIZE: raise ValueError("too large")'},
+  {s:'med',f:'common/crypto.py',t:'generate_self_signed_cert: openssl может отсутствовать',d:'subprocess.run(["openssl", ...]) — openssl может не быть в Docker. FileNotFoundError не отличается от CalledProcessError.',c:'subprocess.run(["openssl", "req", "-x509", ...], check=True)\n# FileNotFoundError если openssl не установлен\n# Нужно: использовать cryptography (Python) вместо внешнего процесса'},
+  {s:'med',f:'server/handler.py',t:'_stream_start: race condition без Lock',d:'if self._streaming: return без Lock. При одновременных вызовах оба могут пройти проверку до присвоения _streaming=True → два потока отправляют кадры одновременно.',c:'def _stream_start(self, p):\n    if self._streaming:  # нет Lock!\n        return\n    self._streaming = True  # race window здесь'},
+  {s:'med',f:'server/handler.py',t:'_file_list: ловит только PermissionError',d:'stat() может бросить OSError (broken symlink), FileNotFoundError (гонка удаления). Эти исключения не пойманы и роняют весь listing.',c:'try:\n    st = e.stat()\nexcept PermissionError:\n    pass\n# OSError, FileNotFoundError — не пойманы → _file_list падает целиком'},
+  {s:'med',f:'server/handler.py',t:'_chunk_begin: нет закрытия предыдущего файла',d:'Если предыдущий chunk transfer не завершился, self._chunk_fh перезаписывается без close() → утечка файлового дескриптора.',c:'def _chunk_begin(self, p):\n    # Нет: if self._chunk_fh: self._chunk_fh.close()\n    self._chunk_fh = open(path, "wb")  # старый fh потерян!'},
+  {s:'med',f:'server/handler.py',t:'_draw_cursor_win: временный c_void_p() в CreateDIBSection',d:'ctypes.byref(ctypes.c_void_p()) — временный объект может быть уничтожен GC сразу после создания. Должна быть переменная с временем жизни на весь вызов.',c:'bits_ptr = ctypes.c_void_p()  # ← должна быть переменная!\nhbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bih), 0,\n    ctypes.byref(ctypes.c_void_p()), None, 0)  # temporary!'},
+  {s:'med',f:'server/relay_agent.py',t:'TCP auth блокирует asyncio event loop',d:'send_msg(tcp, AUTH) и recv_msg(tcp) — блокирующие вызовы выполняются напрямую в async-функции без run_in_executor. Блокируют event loop на время auth.',c:'tcp.setblocking(True)\nsend_msg(tcp, MsgType.AUTH, {"password": password})  # блокирует event loop!\nauth_resp = recv_msg(tcp)  # тоже блокирует'},
+  {s:'med',f:'server/relay_agent.py',t:'Запутанная цепочка settimeout: 0 → blocking → 10 → 120',d:'Четыре изменения режима сокета подряд создают путаницу. Промежуточный non-blocking режим (settimeout(0)) нигде не используется.',c:'tcp.settimeout(0)     # non-blocking — зачем?\ntcp.setblocking(True) # обратно в blocking\ntcp.settimeout(10)    # для auth\ntcp.settimeout(120)   # для работы'},
+  {s:'med',f:'relay/main.py',t:'_progress не очищается по TTL — утечка памяти',d:'Записи удаляются только через /api/files/dl/<uid>. Незавершённые, ошибочные, отменённые операции остаются в dict навсегда вместе с данными файла.',c:'_progress[uid] = {"data": large_bytes, ...}\n# Удаляется ТОЛЬКО при: del _progress[uid] в api_files_dl\n# Закрытие вкладки / ошибка / отмена → утечка'},
+  {s:'med',f:'relay/main.py',t:'SessionMiddleware FastAPI + Flask конкурируют',d:'app.add_middleware(SessionMiddleware) для FastAPI и flask_app.secret_key для Flask — два разных cookie-механизма. Браузер может получить два Set-Cookie: session.',c:'app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)\nflask_app.secret_key = SECRET_KEY\n# Разные форматы: Starlette vs Itsdangerous\n# Браузер: два Set-Cookie: session=...'},
+  {s:'med',f:'relay/main.py',t:'asyncio.create_task(_recv_settings) не отменяется',d:'Task не сохраняется → не может быть отменён явно в finally блоке ws_stream. Живёт до ошибки в своём цикле.',c:'asyncio.create_task(_recv_settings())  # не сохранён!\n# В finally:\n# task.cancel()  ← невозможно\n# Нужно: task = asyncio.create_task(...)\n# finally: task.cancel()'},
+  {s:'med',f:'client/agent.py',t:'cancelled_fn проверяется после recv_msg — задержка отмены',d:'При upload: send CHUNK_DATA → recv ACK (может висеть долго) → check cancel. Отмена обнаруживается только после получения ACK, а не немедленно.',c:'send_msg(self.sock, MsgType.CHUNK_DATA, {...})\nack = recv_msg(self.sock)  # ← может висеть\n# cancelled_fn проверяется ПОСЛЕ recv — задержка'},
+  {s:'med',f:'templates/index.html',t:'Event listener на слайдерах не снимается — утечка',d:'_sendStreamSettings — новая closure при каждом _startRelayStream. Флаг _streamListenerAdded блокирует повторное добавление, но уже добавленная функция содержит stale ссылки.',c:'const _sendStreamSettings = () => { ... }  // новая функция каждый раз!\nif (!qRange._streamListenerAdded) {\n    qRange.addEventListener("input", _sendStreamSettings);\n    qRange._streamListenerAdded = true;\n}\n// removeEventListener не работает — разные ссылки на функцию'},
+  {s:'med',f:'templates/index.html',t:'toggleSelectAll: indeterminate → "выбрать всё" вместо "снять"',d:'При indeterminate состоянии c.checked=false → !false=true → выбирает всё. Пользователь ожидает "снять всё" при клике на частично выбранный чекбокс.',c:'if (checked === undefined) {\n    const c = el2("chkAll");\n    checked = c ? !c.checked : true;\n    // indeterminate: c.checked=false → !false=true → выбрать всё\n    // Ожидается: снять всё\n}'},
+  {s:'med',f:'templates/index.html',t:'esc() не экранирует кавычки — XSS в путях с апострофом',d:"esc() заменяет &, <, > но не ' и \". В agent.html onclick=\"loadFiles('${path}')\" — если имя файла содержит ' — атрибут сломается / XSS.",c:"const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');\n// Не экранирует ' и \"\n// В agent.html: onclick=\"loadFiles('${path}')\"  ← XSS при path содержащем '"},
+  {s:'med',f:'templates/index.html',t:'pathJoin: определение ОС по содержимому пути ненадёжно',d:'sep = base.includes("\\\\") ? "\\\\" : "/" — пути вида "relative/path" всегда получают Unix-разделитель даже на Windows агенте если base не содержит \\\\.',c:'const sep = (base.includes("\\\\") || /^[A-Za-z]:/.test(base)) ? "\\\\" : "/";\n// "relative/path" на Windows → sep="/" → неверный путь'},
+  {s:'med',f:'relay/registry.py',t:'pending не очищается при unregister — зависшие Event',d:'При отключении агента: pending dict с незавершёнными запросами не очищается. Потоки waiting на event.wait() будут висеть до истечения timeout.',c:'def unregister(self, agent_id):\n    with self._lock:\n        self._agents.pop(agent_id, None)\n    # pending запросы не отменяются!\n    # Потоки висят до timeout (120 сек)'},
+  {s:'med',f:'relay/agent_ws.py',t:'ws.receive(timeout=15) игнорируется flask_sock',d:'flask_sock не поддерживает timeout в receive(). При зависшем агенте на handshake соединение висит бесконечно.',c:'raw = ws.receive(timeout=15)  # flask_sock игнорирует timeout!\n# Зависший агент = зависший поток навсегда'},
+  {s:'med',f:'server/web.py',t:'cancel не уведомляет агента — BrokenPipeError на агенте',d:'При отмене скачивания file_conn.invalidate() закрывает TCP. Агент продолжает отправлять данные в закрытый сокет → BrokenPipeError на агенте.',c:'except InterruptedError:\n    file_conn.invalidate()  # закрывает TCP\n    # Агент: send_msg → BrokenPipeError — некорректное завершение\n    # Нужно: отправить DCHUNK_CANCEL перед invalidate()'},
+  {s:'low',f:'common/protocol.py',t:'getattr с fallback строкой маскирует опечатки',d:'dchunk_data = getattr(MsgType, "DCHUNK_DATA", "dchunk_data") — если имя enum члена изменится, fallback строка будет тихо использоваться и нарушит протокол.',c:'dchunk_data = getattr(MsgType, "DCHUNK_DATA", "dchunk_data")  # опасный паттерн\n# При переименовании DCHUNK_DATA → тихий баг\n# Нужно: MsgType.DCHUNK_DATA (упадёт явно при опечатке)'},
+  {s:'low',f:'common/crypto.py',t:'session key в certs/ — сбрасывается при деплое на Render',d:'key_file = CERTS_DIR / ".session_key" — Render ephemeral FS. Ключ исчезает при деплое → все сессии инвалидируются. relay/main.py использует env SECRET_KEY правильно, но server/web.py использует этот метод.',c:'CERTS_DIR = Path(__file__).parent.parent / "certs"\nkey_file = CERTS_DIR / ".session_key"  # ephemeral на Render!\n# relay/main.py правильно: SECRET_KEY = os.environ.get("SECRET_KEY")'},
+  {s:'low',f:'server/handler.py',t:'cpu_percent = 0.0 при первом вызове proc_list',d:'psutil.process_iter с cpu_percent всегда возвращает 0.0 при первом вызове — нужен interval или два вызова.',c:'for pr in psutil.process_iter(["pid","name","cpu_percent",...]):\n    # cpu_percent всегда 0.0 при первом вызове!\n    # Нужно: psutil.cpu_percent(percpu=True) с interval'},
+  {s:'low',f:'server/handler.py',t:'shell=True в _cmd — непредсказуемое поведение спецсимволов',d:'subprocess.run(command, shell=True) на Windows запускает cmd.exe — & | > обрабатываются cmd.exe непредсказуемо. Не уязвимость (RCE и так разрешён), но поведение отличается от ожидаемого.',c:'r = subprocess.run(command, shell=True, ...)\n# Windows: cmd.exe /c <command>\n# Спецсимволы & | > < обрабатываются cmd.exe'},
+  {s:'low',f:'server/relay_agent.py',t:'ping_interval=None для file-канала — NAT таймаут',d:'Без ping-frames NAT-роутеры закрывают соединение после ~300 сек бездействия. При передаче большого файла (10+ мин) WS упадёт в середине.',c:'_ping_interval = None if conn_type == "file" else 30\n# При передаче большого файла (10+ мин):\n# NAT таблицы сбрасывают соединение без keepalive\n# Решение: отправлять ping внутри run_in_executor'},
+  {s:'low',f:'relay/main.py',t:'debug /debug/agents без аутентификации',d:'Endpoint возвращает список всех агентов и pending-запросов без проверки токена. Утечка информации о топологии.',c:'@app.get("/debug/agents")\nasync def debug_agents():  # нет auth!\n    return {"agents": registry.list_agents(), "pending": len(_pending)}'},
+  {s:'low',f:'relay/main.py',t:'Rate limiter сбрасывается при успешном логине',d:'_rl.clear(ip) при успехе позволяет: 4 неудачи → 1 успех → clear → повторить. Эффективный обход rate limiting если один пароль известен.',c:'if freq.form.get("password","") == OPERATOR_PASSWORD:\n    _rl.clear(ip)  # ← атакующий с одним паролем обходит rate limiting\n# Нужно: не сбрасывать счётчик неудачных попыток'},
+  {s:'low',f:'client/agent.py',t:'SSL CERT_NONE — MITM между клиентом и агентом',d:'ctx.verify_mode = ssl.CERT_NONE отключает верификацию сертификата. MITM возможен для перехвата пароля и команд.',c:'ctx.check_hostname = False\nctx.verify_mode = ssl.CERT_NONE  # MITM возможен!\n# Решение: certificate pinning'},
+  {s:'low',f:'client/agent.py',t:'download_zip: index=-1 как "начало" — неочевидный контракт',d:'При i=0 отправляется CHUNK_ACK {index: -1} как сигнал "готов к первому чанку". Контракт нигде не задокументирован в коде.',c:'resp = self._call("chunk_ack", {"index": i - 1})  # i=0 → index=-1\n# Агент ждёт -1 как "go" сигнал\n# Нигде не задокументировано'},
+  {s:'low',f:'templates/index.html',t:'pollProgress: DOM-ошибки при гонке clearInterval',d:'Если hideFn() удаляет DOM-элементы и тут же приходит ещё одна итерация интервала до clearInterval — _updateBar обратится к null элементам.',c:'clearInterval(poll); hideFn(); resolve(null);\n// После hideFn DOM-элементы удалены\n// Если poll тикнет ещё раз до clearInterval — Cannot read properties of null'},
+  {s:'low',f:'templates/index.html',t:'_refreshAgents: параллельные вызовы без дедупликации',d:'setInterval + кнопка ↻ могут запустить параллельные fetch. При медленном сервере состояние selector мигает между двумя ответами.',c:'setInterval(_refreshAgents, 5000);\n// + кнопка: onclick="_refreshAgents()"\n// Нет: let _refreshing = false'},
+  {s:'low',f:'templates/index.html',t:'loadFiles: race condition при быстрой навигации',d:'Без AbortController параллельные запросы могут вернуться в другом порядке. Устаревший ответ перезапишет актуальное содержимое директории.',c:'const r = await apiGet("/api/files?path="+...);\n// Нет AbortController, нет версионирования\nel2("fileList").innerHTML = ...  // может быть результат старого запроса'}
+];
+
+let curFilter = 'all';
+
+function filter(f, el) {
+  curFilter = f;
+  document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  render();
+}
+
+function render() {
+  const q = document.getElementById('search').value.toLowerCase();
+  const list = document.getElementById('list');
+  const groups = ['crit','high','med','low'];
+  const glabels = {crit:'Критические',high:'Высокие',med:'Средние',low:'Низкие'};
+  const tgclass = {crit:'tgc',high:'tgh',med:'tgm',low:'tgl'};
+  const bclass = {crit:'bc',high:'bh',med:'bm',low:'bl'};
+  const slabel = {crit:'критический',high:'высокий',med:'средний',low:'низкий'};
+  let html = '';
+  let total = 0;
+  groups.forEach(sev => {
+    const bugs = BUGS.filter(b => {
+      if (curFilter !== 'all' && b.s !== curFilter) return false;
+      if (q && !b.t.toLowerCase().includes(q) && !b.f.toLowerCase().includes(q) && !b.d.toLowerCase().includes(q)) return false;
+      return true;
+    }).filter(b => b.s === sev);
+    if (!bugs.length) return;
+    total += bugs.length;
+    html += `<div class="section-lbl">${glabels[sev]} (${bugs.length})</div>`;
+    bugs.forEach((bug, i) => {
+      const id = `d-${sev}-${i}`;
+      html += `<div class="bug" onclick="toggle('${id}',this)">
+        <div class="bar ${bclass[sev]}"></div>
+        <div class="bdy">
+          <div class="hd">
+            <span class="tt">${bug.t}</span>
+            <span class="tg ${tgclass[sev]}">${slabel[sev]}</span>
+            <span class="fb">${bug.f}</span>
+          </div>
+          <div class="ds">${bug.d}</div>
+          <div class="dt" id="${id}">${bug.c}</div>
+        </div>
+      </div>`;
+    });
+  });
+  list.innerHTML = html || '<div style="color:var(--color-text-tertiary);padding:20px;text-align:center">ничего не найдено</div>';
+  document.getElementById('count').textContent = `Показано: ${total} из ${BUGS.length}`;
+}
+
+function toggle(id, row) {
+  const d = document.getElementById(id);
+  if (!d) return;
+  d.classList.toggle('show');
+  row.classList.toggle('open');
+}
+
+render();
+</script>

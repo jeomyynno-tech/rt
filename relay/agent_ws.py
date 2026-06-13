@@ -1,28 +1,48 @@
 """
 WebSocket endpoint для агентов.
 Агент подключается сюда, регистрируется, затем получает команды и отправляет ответы.
+
+Известное ограничение: flask_sock игнорирует timeout=N в ws.receive() — он
+форсирует свой собственный (или ждёт навсегда). Поэтому handshake защищаем
+отдельным потоком-сторожем, а основной recv-цикл оставляем без timeout
+(агенты сами шлют ping каждые 30 секунд — мёртвое соединение распознаётся
+обрывом TCP).
 """
 
 import json
+import threading
+import time
 from relay.registry import registry
 
 
+def _watchdog(ws, deadline, fired):
+    """Закрывает ws если handshake не пришёл за deadline секунд."""
+    time.sleep(deadline)
+    if not fired.is_set():
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
 def handle_agent_ws(ws, password_hash: str):
-    """
-    Обрабатывает WebSocket-соединение одного агента.
-    Вызывается flask_sock в отдельном потоке на каждое подключение.
-    """
     from common.crypto import check_password
 
-    # ── Аутентификация ────────────────────────────────────────────────── #
+    # ── Handshake с watchdog'ом (flask_sock игнорирует receive(timeout=…)) ── #
+    handshake_done = threading.Event()
+    threading.Thread(target=_watchdog, args=(ws, 15, handshake_done), daemon=True).start()
+
     try:
-        raw = ws.receive(timeout=15)
+        raw = ws.receive()  # timeout-параметр здесь бесполезен, см. модульный docstring
         if raw is None:
             return
         msg = json.loads(raw)
     except Exception:
-        ws.send(json.dumps({"type": "auth_fail", "reason": "invalid handshake"}))
+        try: ws.send(json.dumps({"type": "auth_fail", "reason": "invalid handshake"}))
+        except Exception: pass
         return
+    finally:
+        handshake_done.set()
 
     if msg.get("type") != "register":
         ws.send(json.dumps({"type": "auth_fail", "reason": "expected register"}))
@@ -39,17 +59,15 @@ def handle_agent_ws(ws, password_hash: str):
         ws.send(json.dumps({"type": "auth_fail", "reason": "wrong password"}))
         return
 
-    # ── Регистрация ───────────────────────────────────────────────────── #
     entry = registry.register(agent_id, ws)
-    entry.info = msg.get("info", {})   # hostname, OS и т.д.
+    entry.info = msg.get("info", {})
 
     ws.send(json.dumps({"type": "registered", "agent_id": agent_id}))
     print(f"[relay] Agent connected: {agent_id}")
 
-    # ── Цикл приёма ответов от агента ────────────────────────────────── #
     try:
         while True:
-            raw = ws.receive(timeout=300)   # 5 минут тишины = отключение
+            raw = ws.receive()
             if raw is None:
                 break
             try:
@@ -61,7 +79,8 @@ def handle_agent_ws(ws, password_hash: str):
             if req_id:
                 registry.deliver(agent_id, req_id, resp)
             elif resp.get("type") == "ping":
-                ws.send(json.dumps({"type": "pong"}))
+                try: ws.send(json.dumps({"type": "pong"}))
+                except Exception: break
 
     except Exception:
         pass

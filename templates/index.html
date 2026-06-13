@@ -365,7 +365,15 @@ input[type=range]{accent-color:var(--acc)}
 // ── Helpers ──────────────────────────────────────────────────────────
 const el  = tab => document.querySelector('[data-tab='+tab+']');
 const el2 = id  => document.getElementById(id);
-const esc = s   => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+// esc должен экранировать ' и " тоже — иначе путь "O'Brien" сломает
+// onclick="loadFiles('${path}')" в agent.html (закрывающая кавычка попадает
+// в значение атрибута и превращается в XSS-вектор).
+const esc = s => String(s||'')
+  .replace(/&/g,'&amp;')
+  .replace(/</g,'&lt;')
+  .replace(/>/g,'&gt;')
+  .replace(/"/g,'&quot;')
+  .replace(/'/g,'&#39;');
 
 function toast(msg, type='in') {
   const d = document.createElement('div');
@@ -387,13 +395,20 @@ function _agentHeaders(extra={}) {
   return {...extra, 'X-Agent-Id': _currentAgent};
 }
 
-async function apiGet(url) {
+async function apiGet(url, opts={}) {
+  // opts.signal — AbortSignal. AbortError пробрасываем, чтобы вызывающий код
+  // мог отличить отмену от ошибки сети.
   try {
-    const r = await fetch(url, {headers: _agentHeaders()});
+    const init = {headers: _agentHeaders()};
+    if (opts.signal) init.signal = opts.signal;
+    const r = await fetch(url, init);
     const j = await r.json();
     if (!r.ok) return {error: j.error || 'HTTP '+r.status};
     return j;
-  } catch(e) { return {error: String(e)}; }
+  } catch(e) {
+    if (e && e.name === 'AbortError') throw e;
+    return {error: String(e)};
+  }
 }
 
 async function apiPost(url, body={}) {
@@ -492,11 +507,21 @@ function _renderAgentSelector(agents) {
   }
 }
 
+let _refreshingAgents = false;
 async function _refreshAgents() {
-  const r = await fetch('/api/agents').catch(() => null);
-  if (!r || !r.ok) return;
-  const data = await r.json().catch(() => null);
-  if (data && Array.isArray(data.agents)) _renderAgentSelector(data.agents);
+  // Дедупликация: setInterval + ручной клик кнопки ↻ могут запустить
+  // параллельные fetch, и медленный ответ может перетереть быстрый
+  // → selector "мигает". Простой mutex решает.
+  if (_refreshingAgents) return;
+  _refreshingAgents = true;
+  try {
+    const r = await fetch('/api/agents').catch(() => null);
+    if (!r || !r.ok) return;
+    const data = await r.json().catch(() => null);
+    if (data && Array.isArray(data.agents)) _renderAgentSelector(data.agents);
+  } finally {
+    _refreshingAgents = false;
+  }
 }
 
 // ── Tabs ─────────────────────────────────────────────────────────────
@@ -578,9 +603,19 @@ let _selected   = new Set();
 let _sortCol    = 'name';
 let _sortDir    = 1;
 
+// Запоминаем платформу удалённого агента по флагу из последнего file_list.
+// Так относительные пути вроде "data/file.txt" всё равно соединяются
+// правильным разделителем когда base сам без \ или :.
+let _agentIsWin = null;
+
 function pathJoin(base, name) {
   base = base.replace(/[\/\\]+$/,'');
-  const sep = (base.includes('\\') || /^[A-Za-z]:/.test(base)) ? '\\' : '/';
+  let sep;
+  if (base.includes('\\') || /^[A-Za-z]:/.test(base)) sep = '\\';
+  else if (base.includes('/')) sep = '/';
+  else if (_agentIsWin === true)  sep = '\\';
+  else if (_agentIsWin === false) sep = '/';
+  else sep = '/';   // последний fallback
   return base + sep + name;
 }
 
@@ -630,6 +665,12 @@ function sortArrow(col) {
     : '<span style="color:var(--acc);margin-left:4px">↓</span>';
 }
 
+// Версионируем загрузку: устаревший ответ от предыдущего быстрого клика
+// не должен перезаписывать актуальный список. Старые запросы отменяются
+// через AbortController, плюс проверяем номер версии перед записью в DOM.
+let _loadFilesGen = 0;
+let _loadFilesAbort = null;
+
 async function loadFiles(path) {
   if (path !== undefined) { curPath=path; el2('fpInput').value=path; }
   else curPath = el2('fpInput').value.trim();
@@ -637,9 +678,29 @@ async function loadFiles(path) {
   el2('fileSearch').value = '';
   if (el2('fileTypeFilter')) el2('fileTypeFilter').value = 'all';
   el2('fileList').innerHTML = '<div class="loading"><span class="spin-icon">⏳</span> Загрузка...</div>';
-  const r = await apiGet('/api/files?path='+encodeURIComponent(curPath));
+
+  if (_loadFilesAbort) { try { _loadFilesAbort.abort(); } catch(_) {} }
+  _loadFilesAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const myGen = ++_loadFilesGen;
+
+  let r;
+  try {
+    r = await apiGet('/api/files?path='+encodeURIComponent(curPath),
+                     _loadFilesAbort ? {signal: _loadFilesAbort.signal} : undefined);
+  } catch (e) {
+    if (e && (e.name === 'AbortError' || /abort/i.test(e.message||''))) return;
+    el2('fileList').innerHTML = '';
+    toast(String(e), 'er');
+    return;
+  }
+
+  if (myGen !== _loadFilesGen) return;   // прилетел устаревший ответ — игнор
+
   if (r.error) { el2('fileList').innerHTML = ''; toast(r.error,'er'); return; }
-  if (r.path) { curPath=r.path; el2('fpInput').value=r.path; }
+  if (r.path) {
+    curPath=r.path; el2('fpInput').value=r.path;
+    _agentIsWin = (r.path.includes('\\') || /^[A-Za-z]:/.test(r.path));
+  }
   _allEntries = r.entries || [];
   renderFiles(_allEntries);
 }
@@ -724,7 +785,14 @@ function toggleOne(path, checked, row) {
 }
 
 function toggleSelectAll(checked) {
-  if (checked===undefined) { const c=el2('chkAll'); checked=c?!c.checked:true; }
+  if (checked===undefined) {
+    const c = el2('chkAll');
+    // indeterminate (часть выделена) → пользователь хочет "снять всё".
+    // c.checked у indeterminate чекбокса = false → !false=true → "выбрать всё".
+    // Поэтому отдельно ловим indeterminate и форсим "снять".
+    if (c && c.indeterminate) checked = false;
+    else                       checked = c ? !c.checked : true;
+  }
   document.querySelectorAll('.frow').forEach(row => {
     checked ? _selected.add(row.dataset.path) : _selected.delete(row.dataset.path);
     row.classList.toggle('frow-sel', checked);
@@ -858,13 +926,14 @@ function _makeBar(id, color, bottomPx) {
 }
 
 function _updateBar(id, name, received, total, icon) {
+  // Бар мог быть удалён (hideFn) между тиками setInterval — все getElementById
+  // защищаем null-проверкой. Иначе TypeError "Cannot set properties of null".
   const pct = total>0 ? Math.min(100, Math.round(received/total*100)) : 0;
-  el2(id+'Name').textContent = icon+' '+name;
-  el2(id+'Pct').textContent  = pct+'%';
-  // Не трогаем width если активен JS-shimmer
-  const fill = el2(id+'Fill');
+  const nameEl  = el2(id+'Name');  if (nameEl)  nameEl.textContent = icon+' '+name;
+  const pctEl   = el2(id+'Pct');   if (pctEl)   pctEl.textContent  = pct+'%';
+  const fill    = el2(id+'Fill');
   if (fill && !_shimmerRafs[fill.id]) fill.style.width = pct+'%';
-  el2(id+'Bytes').textContent= fmtSz(received)+' / '+fmtSz(total);
+  const bytesEl = el2(id+'Bytes'); if (bytesEl) bytesEl.textContent = fmtSz(received)+' / '+fmtSz(total);
 }
 
 function _hideBar(id) { const b=el2(id); if (b) b.remove(); }
@@ -1243,29 +1312,28 @@ function _startRelayStream() {
     }
   };
 
-  // При изменении качества, FPS или захватчика — обновляем UI и уведомляем relay
-  const qRange = el2('qRange');
+  // Слушатель settings-слайдеров: чтобы removeEventListener работал, держим
+  // ОДНУ и ту же ссылку на функцию на каждом элементе. Прошлая реализация
+  // создавала новую closure на каждый _startRelayStream, накапливая утечку.
+  const qRange   = el2('qRange');
   const fpsRange = el2('fpsRange');
-  const capSel  = el2('capturerSel');
-  const _sendStreamSettings = () => {
-    if (qRange) el2('qVal').textContent = qRange.value;
+  const capSel   = el2('capturerSel');
+  const sendSettings = () => {
+    if (qRange)   el2('qVal').textContent   = qRange.value;
     if (fpsRange) el2('fpsVal').textContent = fpsRange.value;
     if (_streamWs && _streamWs.readyState === WebSocket.OPEN) {
       _streamWs.send(JSON.stringify(_streamSettings()));
     }
   };
-  if (qRange && !qRange._streamListenerAdded) {
-    qRange.addEventListener('input', _sendStreamSettings);
-    qRange._streamListenerAdded = true;
+  function _attachOnce(el, evt, key) {
+    if (!el) return;
+    if (el[key]) el.removeEventListener(evt, el[key]);
+    el[key] = sendSettings;
+    el.addEventListener(evt, sendSettings);
   }
-  if (fpsRange && !fpsRange._streamListenerAdded) {
-    fpsRange.addEventListener('input', _sendStreamSettings);
-    fpsRange._streamListenerAdded = true;
-  }
-  if (capSel && !capSel._streamListenerAdded) {
-    capSel.addEventListener('change', _sendStreamSettings);
-    capSel._streamListenerAdded = true;
-  }
+  _attachOnce(qRange,   'input',  '_streamSettingsCb');
+  _attachOnce(fpsRange, 'input',  '_streamSettingsCb');
+  _attachOnce(capSel,   'change', '_streamSettingsCb');
 }
 
 function _relayStreamTick() {
@@ -1304,9 +1372,11 @@ function screenCoords(e) {
 async function screenTypeSend() {
   const inp=el2('screenTypeIn'), text=inp.value;
   if (!text) return;
-  const r1 = await apiPost('/api/clipboard', {text});
-  if (r1.error) { toast('Ошибка буфера: '+r1.error,'er'); return; }
-  await apiPost('/api/keyboard/hotkey', {keys:['ctrl','v']});
+  // Раньше отправляли через clipboard+Ctrl+V — это затирало буфер обмена
+  // пользователя агента. Используем прямой keyboard/type — он печатает
+  // юникод через низкоуровневые API без вмешательства в clipboard.
+  const r = await apiPost('/api/keyboard/type', {text});
+  if (r.error) { toast('Ошибка ввода: '+r.error,'er'); return; }
   inp.value = '';
 }
 function screenTypeKey(e) { if (e.key==='Enter') { e.preventDefault(); screenTypeSend(); } }
@@ -1395,10 +1465,10 @@ async function doCustomHotkey() { const keys=el2('hkIn').value.trim().split(/\s+
 async function doType() {
   const text = el2('typeText').value;
   if (!text) return;
-  const r1 = await apiPost('/api/clipboard', {text});
-  if (r1.error) { toast('Ошибка буфера: '+r1.error,'er'); return; }
-  const r2 = await apiPost('/api/keyboard/hotkey', {keys:['ctrl','v']});
-  if (r2.ok) { toast('Отправлено','ok'); el2('typeText').value=''; } else toast(r2.error,'er');
+  // Раньше: clipboard + Ctrl+V — затирает буфер обмена пользователя агента.
+  // Теперь: keyboard/type печатает символы напрямую без вмешательства в clipboard.
+  const r = await apiPost('/api/keyboard/type', {text});
+  if (r.ok) { toast('Отправлено','ok'); el2('typeText').value=''; } else toast(r.error,'er');
 }
 
 // ── Clipboard ──────────────────────────────────────────────────────────

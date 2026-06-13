@@ -14,18 +14,21 @@ from dataclasses import dataclass, field
 @dataclass
 class AgentEntry:
     agent_id:   str
-    ws          = None          # flask_sock WS-объект
+    ws          = None                                  # flask_sock WS-объект
     lock:       threading.Lock  = field(default_factory=threading.Lock)
-    pending:    dict            = field(default_factory=dict)  # req_id → {event, result}
-    info:       dict            = field(default_factory=dict)  # произвольная мета
+    # Отдельный send_lock сериализует ws.send() между потоками. send_lock
+    # держится КОРОТКО (только во время send) — не блокирует deliver() как
+    # бы это сделал общий entry.lock.
+    send_lock:  threading.Lock  = field(default_factory=threading.Lock)
+    pending:    dict            = field(default_factory=dict)  # req_id → {event, slot}
+    info:       dict            = field(default_factory=dict)
 
 
 class AgentRegistry:
     def __init__(self):
-        self._agents: dict[str, AgentEntry] = {}
+        self._agents: dict = {}
         self._lock = threading.Lock()
 
-    # ── Регистрация / разрегистрация ─────────────────────────────────── #
     def register(self, agent_id: str, ws) -> AgentEntry:
         entry = AgentEntry(agent_id=agent_id)
         entry.ws = ws
@@ -34,24 +37,43 @@ class AgentRegistry:
         return entry
 
     def unregister(self, agent_id: str):
+        """
+        Удаляет агента и БУДИТ всех ожидающих на event.wait():
+        потоки получают ответ-ошибку вместо вечного зависания до timeout.
+        """
         with self._lock:
-            self._agents.pop(agent_id, None)
+            entry = self._agents.pop(agent_id, None)
+        if entry is None:
+            return
+        # Отменяем все pending — поток в call() увидит result == disconnect.
+        with entry.lock:
+            pending = list(entry.pending.items())
+            entry.pending.clear()
+        err = {"type": "error", "payload": {"reason": f"Agent '{agent_id}' disconnected"}}
+        for req_id, slot in pending:
+            slot["slot"]["result"] = err
+            slot["event"].set()
 
-    def get(self, agent_id: str) -> AgentEntry | None:
+    def get(self, agent_id: str):
         with self._lock:
             return self._agents.get(agent_id)
 
-    def list_agents(self) -> list[dict]:
+    def list_agents(self) -> list:
         with self._lock:
             return [{"agent_id": e.agent_id, **e.info}
                     for e in self._agents.values()]
 
-    # ── Отправка команды и ожидание ответа ───────────────────────────── #
     def call(self, agent_id: str, msg_type: str, payload: dict,
              timeout: float = 120.0) -> dict:
         """
         Отправляет команду агенту и блокирует поток до получения ответа.
         Возвращает {'type': ..., 'payload': ...} или {'type': 'error', ...}.
+
+        Лок-стратегия:
+          - entry.lock берётся ТОЛЬКО на быстрые операции с pending-словарём.
+          - entry.send_lock держится во время ws.send() — но НЕ под entry.lock,
+            иначе deliver() (тоже берущий entry.lock) залочится насмерть,
+            если буфер ws заполнен и send блокируется.
         """
         entry = self.get(agent_id)
         if entry is None:
@@ -70,16 +92,16 @@ class AgentRegistry:
                 "type":    msg_type,
                 "payload": payload,
             })
-            # Отправляем в WS-поток агента
-            # send() flask_sock вызывается из другого потока — нужна блокировка
-            with entry.lock:
-                try:
+            # send_lock сериализует параллельные send() из разных потоков,
+            # но НЕ блокирует deliver() (тот использует entry.lock).
+            try:
+                with entry.send_lock:
                     entry.ws.send(msg)
-                except Exception as e:
+            except Exception as e:
+                with entry.lock:
                     entry.pending.pop(req_id, None)
-                    return {"type": "error", "payload": {"reason": f"Send failed: {e}"}}
+                return {"type": "error", "payload": {"reason": f"Send failed: {e}"}}
 
-            # Ждём ответ
             if not event.wait(timeout=timeout):
                 with entry.lock:
                     entry.pending.pop(req_id, None)
@@ -98,7 +120,7 @@ class AgentRegistry:
         if not entry:
             return
         with entry.lock:
-            pending = entry.pending.get(req_id)
+            pending = entry.pending.pop(req_id, None)
         if pending:
             pending["slot"]["result"] = response
             pending["event"].set()

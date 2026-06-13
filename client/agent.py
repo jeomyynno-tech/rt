@@ -1,14 +1,21 @@
 """
 RemoteAgent — API-клиент к серверу.
 """
-import ssl, socket, base64, threading
+import ssl, socket, base64, threading, os
 from pathlib import Path
 from common.protocol import send_msg, recv_msg, MsgType, CHUNK_SIZE
 
 
 class RemoteAgent:
-    def __init__(self, host, port, password, use_ssl=True):
+    def __init__(self, host, port, password, use_ssl=True, ca_cert: str = None):
+        """
+        ca_cert: путь к CA-сертификату агента. Если задан — TLS-handshake
+        проверяет, что сервер предъявил сертификат, подписанный этим CA
+        (certificate pinning). Защищает от MITM на пути клиент → агент.
+        Если None — режим небезопасной верификации (только для localhost!).
+        """
         self.host, self.port, self.password, self.use_ssl = host, port, password, use_ssl
+        self.ca_cert = ca_cert
         self.sock = None
         self._lock = threading.Lock()
 
@@ -18,10 +25,22 @@ class RemoteAgent:
         raw.settimeout(10)
 
         if self.use_ssl:
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+            if self.ca_cert and os.path.exists(self.ca_cert):
+                # Безопасный режим: pinning по CA. MITM невозможен без
+                # приватного ключа агента.
+                ctx = ssl.create_default_context(cafile=self.ca_cert)
+                # Самоподписанные сертификаты обычно не валидны по hostname.
+                # check_hostname=False допустимо т.к. мы pinим CA.
+                ctx.check_hostname = False
+                self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+            else:
+                # Небезопасный fallback — только для localhost-трафика,
+                # где MITM не имеет смысла. Для удалённых подключений
+                # ОБЯЗАТЕЛЬНО передавайте ca_cert.
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
         else:
             self.sock = raw
 
@@ -64,7 +83,6 @@ class RemoteAgent:
         return self._call(MsgType.FILE_LIST, {"path": path})
 
     def upload_bytes(self, remote_path, data: bytes):
-        """Маленький файл (<4MB) одним сообщением."""
         return self._call(MsgType.FILE_UPLOAD, {
             "path": remote_path,
             "data": base64.b64encode(data).decode(),
@@ -81,9 +99,7 @@ class RemoteAgent:
         total  = len(data)
         chunks = [data[i:i+CHUNK_SIZE] for i in range(0, max(total, 1), CHUNK_SIZE)]
         with self._lock:
-            # Проверяем отмену до открытия файла на агенте
             if cancelled_fn and cancelled_fn():
-                print(f"[client/upload] cancelled before chunk_begin path={remote_path}")
                 raise InterruptedError("upload cancelled before start")
 
             send_msg(self.sock, MsgType.CHUNK_BEGIN, {
@@ -94,9 +110,7 @@ class RemoteAgent:
                 return ack
             sent = 0
             for i, chunk in enumerate(chunks):
-                # Проверяем отмену ПЕРЕД отправкой чанка
                 if cancelled_fn and cancelled_fn():
-                    print(f"[client/upload] cancelled at chunk={i+1}/{len(chunks)}, sending chunk_cancel path={remote_path}")
                     send_msg(self.sock, MsgType.CHUNK_CANCEL, {})
                     raise InterruptedError("upload cancelled by operator")
 
@@ -108,9 +122,7 @@ class RemoteAgent:
                     return ack
                 sent += len(chunk)
 
-                # Проверяем отмену ПОСЛЕ получения ACK
                 if cancelled_fn and cancelled_fn():
-                    print(f"[client/upload] cancelled after chunk={i+1}/{len(chunks)}, sending chunk_cancel path={remote_path}")
                     send_msg(self.sock, MsgType.CHUNK_CANCEL, {})
                     raise InterruptedError("upload cancelled by operator")
 
@@ -118,19 +130,20 @@ class RemoteAgent:
                     try: progress_cb(sent, total)
                     except InterruptedError: raise
                     except Exception: pass
-                if i == 0 or i == len(chunks) - 1 or i % 20 == 0:
-                    print(f"[client/upload] chunk={i+1}/{len(chunks)} size={len(chunk)} sent={sent}")
             send_msg(self.sock, MsgType.CHUNK_END, {})
             return recv_msg(self.sock)
 
     def upload(self, local_path, remote_path):
         return self.upload_bytes(remote_path, Path(local_path).read_bytes())
 
-    def download_bytes(self, remote_path):
+    def download_bytes(self, remote_path, sink_path: str = None) -> bytes:
         """
         Скачать файл с агента.
-        Сервер сам решает: FILE_DATA (малый) или чанки (большой).
-        Возвращает bytes.
+
+        sink_path: если задан — чанки потоково пишутся в указанный файл,
+        в памяти держится только текущий чанк. Возвращает None.
+        Без sink_path возвращает bytes (старое поведение для совместимости —
+        не использовать для файлов > 100 MB).
         """
         with self._lock:
             send_msg(self.sock, MsgType.FILE_DOWNLOAD, {"path": remote_path})
@@ -141,27 +154,49 @@ class RemoteAgent:
                 raise RuntimeError(msg["payload"].get("reason", "download failed"))
 
             if t == MsgType.FILE_DATA:
-                return base64.b64decode(msg["payload"]["data"])
+                data = base64.b64decode(msg["payload"]["data"])
+                if sink_path:
+                    with open(sink_path, "wb") as f: f.write(data)
+                    return None
+                return data
 
             if t == MsgType.DCHUNK_BEGIN:
-                total = msg["payload"].get("total_size", 0)
-                n     = msg["payload"].get("total_chunks", 0)
+                n = msg["payload"].get("total_chunks", 0)
+                # Контракт: ACK с index=-1 — сигнал агенту "готов принять
+                # первый чанк". Любое другое отрицательное значение
+                # агент игнорирует.
                 send_msg(self.sock, MsgType.DCHUNK_ACK, {"index": -1})
-                buf = bytearray()
-                for i in range(n):
-                    chunk_msg = recv_msg(self.sock)
-                    if chunk_msg.get("type") == MsgType.ERROR:
-                        raise RuntimeError(chunk_msg["payload"].get("reason", "chunk error"))
-                    buf += base64.b64decode(chunk_msg["payload"]["data"])
-                    send_msg(self.sock, MsgType.DCHUNK_ACK, {"index": i})
-                recv_msg(self.sock)  # DCHUNK_END
-                return bytes(buf)
+                fh = open(sink_path, "wb") if sink_path else None
+                buf = None if sink_path else bytearray()
+                try:
+                    for i in range(n):
+                        chunk_msg = recv_msg(self.sock)
+                        if chunk_msg.get("type") == MsgType.ERROR:
+                            raise RuntimeError(chunk_msg["payload"].get("reason", "chunk error"))
+                        chunk = base64.b64decode(chunk_msg["payload"]["data"])
+                        if fh:
+                            fh.write(chunk)
+                        else:
+                            # extend быстрее чем +=, не создаёт промежуточный bytes
+                            buf.extend(chunk)
+                        send_msg(self.sock, MsgType.DCHUNK_ACK, {"index": i})
+                    recv_msg(self.sock)  # DCHUNK_END
+                finally:
+                    if fh:
+                        try: fh.close()
+                        except Exception: pass
+                return None if sink_path else bytes(buf)
 
             raise RuntimeError(f"unexpected response: {t}")
 
-    def download_bytes_with_progress(self, remote_path, progress_cb=None, cancelled_fn=None) -> bytes:
-        """download_bytes с вызовами progress_cb(received, total).
-        cancelled_fn() — функция без аргументов, возвращает True если передача отменена.
+    def download_bytes_with_progress(self, remote_path, progress_cb=None,
+                                      cancelled_fn=None, sink_path: str = None):
+        """
+        Скачивание с прогрессом и поддержкой отмены.
+
+        sink_path: если задан — чанки пишутся в файл, в памяти только текущий
+        чанк. Без него возвращает bytes (для маленьких файлов).
+        cancelled_fn() — функция без аргументов, True если передача отменена.
         При отмене отправляет DCHUNK_CANCEL агенту и бросает InterruptedError.
         """
         with self._lock:
@@ -174,51 +209,62 @@ class RemoteAgent:
 
             if t == MsgType.FILE_DATA:
                 data = base64.b64decode(msg["payload"]["data"])
+                if sink_path:
+                    with open(sink_path, "wb") as f: f.write(data)
                 if progress_cb: progress_cb(len(data), len(data))
-                return data
+                return None if sink_path else data
 
             if t == MsgType.DCHUNK_BEGIN:
                 total = msg["payload"].get("total_size", 0)
                 n     = msg["payload"].get("total_chunks", 0)
-                print(f"[client/dchunk] begin path={remote_path} total={total} chunks={n}")
 
-                # Проверяем отмену до отправки первого ACK
                 if cancelled_fn and cancelled_fn():
-                    print(f"[client/dchunk] cancelled before start, sending dchunk_cancel path={remote_path}")
                     send_msg(self.sock, MsgType.DCHUNK_CANCEL, {"reason": "cancelled_by_operator"})
                     raise InterruptedError("download cancelled by operator")
 
+                # ACK index=-1 — сигнал агенту "готов к первому чанку".
+                # (Этот контракт описан в protocol.py)
                 send_msg(self.sock, MsgType.DCHUNK_ACK, {"index": -1})
-                buf = bytearray()
-                for i in range(n):
-                    # Проверяем отмену ПЕРЕД ACK следующего чанка
-                    if cancelled_fn and cancelled_fn():
-                        print(f"[client/dchunk] cancelled at chunk={i+1}/{n}, sending dchunk_cancel path={remote_path}")
-                        send_msg(self.sock, MsgType.DCHUNK_CANCEL, {"reason": "cancelled_by_operator"})
-                        raise InterruptedError("download cancelled by operator")
 
-                    chunk_msg = recv_msg(self.sock)
-                    if chunk_msg.get("type") == MsgType.ERROR:
-                        raise RuntimeError(chunk_msg["payload"].get("reason", "chunk error"))
-                    chunk = base64.b64decode(chunk_msg["payload"]["data"])
-                    buf += chunk
-                    if progress_cb:
-                        try: progress_cb(len(buf), total)
+                fh = open(sink_path, "wb") if sink_path else None
+                buf = None if sink_path else bytearray()
+                received = 0
+                try:
+                    for i in range(n):
+                        if cancelled_fn and cancelled_fn():
+                            send_msg(self.sock, MsgType.DCHUNK_CANCEL, {"reason": "cancelled_by_operator"})
+                            raise InterruptedError("download cancelled by operator")
+
+                        chunk_msg = recv_msg(self.sock)
+                        if chunk_msg.get("type") == MsgType.ERROR:
+                            raise RuntimeError(chunk_msg["payload"].get("reason", "chunk error"))
+                        chunk = base64.b64decode(chunk_msg["payload"]["data"])
+                        if fh:
+                            fh.write(chunk)
+                        else:
+                            buf.extend(chunk)
+                        received += len(chunk)
+                        if progress_cb:
+                            # InterruptedError из cb (если он бросает) ДОЛЖЕН
+                            # пробрасываться, иначе отмена не сработает.
+                            try: progress_cb(received, total)
+                            except InterruptedError: raise
+                            except Exception: pass
+                        send_msg(self.sock, MsgType.DCHUNK_ACK, {"index": i})
+
+                    recv_msg(self.sock)  # DCHUNK_END
+                finally:
+                    if fh:
+                        try: fh.close()
                         except Exception: pass
-                    if i == 0 or i == n - 1 or i % 20 == 0:
-                        print(f"[client/dchunk] chunk={i+1}/{n} size={len(chunk)}")
-                    send_msg(self.sock, MsgType.DCHUNK_ACK, {"index": i})
-
-                recv_msg(self.sock)  # DCHUNK_END
-                print(f"[client/dchunk] end path={remote_path} received={len(buf)}")
-                return bytes(buf)
+                return None if sink_path else bytes(buf)
 
             raise RuntimeError(f"unexpected response: {t}")
 
     def download(self, remote_path, local_path):
-        data = self.download_bytes(remote_path)
-        Path(local_path).write_bytes(data)
-        return data
+        # Стримим напрямую в файл — для больших файлов не съедаем 2x размер RAM.
+        self.download_bytes(remote_path, sink_path=local_path)
+        return None
 
     def file_delete(self, path):
         return self._call(MsgType.FILE_DELETE, {"path": path})
@@ -230,11 +276,13 @@ class RemoteAgent:
         return self._call(MsgType.FILE_RENAME, {"src": src, "dst": dst})
 
     def file_zip(self, paths: list, dest: str):
-        """Создать zip-архив на агенте и сохранить там."""
         return self._call(MsgType.FILE_ZIP, {"paths": paths, "dest": dest})
 
-    def download_zip(self, paths: list, progress_cb=None) -> bytes:
-        """Запаковать выбранные файлы на агенте, получить zip чанками."""
+    def download_zip(self, paths: list, progress_cb=None, sink_path: str = None):
+        """
+        Запаковать выбранные файлы на агенте, получить zip чанками.
+        sink_path: если задан — пишем в файл стримом.
+        """
         with self._lock:
             send_msg(self.sock, MsgType.FILE_ZIP_STREAM, {"paths": paths})
             meta = recv_msg(self.sock)
@@ -242,18 +290,31 @@ class RemoteAgent:
                 raise RuntimeError(meta["payload"].get("reason", "zip failed"))
             total = meta["payload"]["total_size"]
             n     = meta["payload"]["total_chunks"]
-            buf   = bytearray()
-            for i in range(n):
-                chunk_msg = recv_msg(self.sock)
-                if chunk_msg.get("type") == MsgType.ERROR:
-                    raise RuntimeError(chunk_msg["payload"].get("reason", "zip stream error"))
-                buf  += base64.b64decode(chunk_msg["payload"]["data"])
-                if progress_cb:
-                    try: progress_cb(len(buf), total)
+            fh = open(sink_path, "wb") if sink_path else None
+            buf = None if sink_path else bytearray()
+            received = 0
+            try:
+                for i in range(n):
+                    chunk_msg = recv_msg(self.sock)
+                    if chunk_msg.get("type") == MsgType.ERROR:
+                        raise RuntimeError(chunk_msg["payload"].get("reason", "zip stream error"))
+                    chunk = base64.b64decode(chunk_msg["payload"]["data"])
+                    if fh:
+                        fh.write(chunk)
+                    else:
+                        buf.extend(chunk)
+                    received += len(chunk)
+                    if progress_cb:
+                        try: progress_cb(received, total)
+                        except InterruptedError: raise
+                        except Exception: pass
+                    send_msg(self.sock, MsgType.CHUNK_ACK, {"index": i})
+                recv_msg(self.sock)  # OK
+            finally:
+                if fh:
+                    try: fh.close()
                     except Exception: pass
-                send_msg(self.sock, MsgType.CHUNK_ACK, {"index": i})
-            recv_msg(self.sock)  # OK
-            return bytes(buf)
+            return None if sink_path else bytes(buf)
 
     # ── Screen ────────────────────────────────────────────────────────── #
     def screenshot(self, quality=70):

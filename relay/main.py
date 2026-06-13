@@ -7,10 +7,11 @@ Relay-сервер. Деплоится на Render.com.
 
 Env-переменные (задать в Render Dashboard):
   OPERATOR_PASSWORD  — пароль входа в веб-интерфейс (обязательно)
-  SECRET_KEY         — генерируется автоматически
+  SECRET_KEY         — постоянный ключ Flask-сессий (РЕКОМЕНДУЕТСЯ:
+                        Render free tier теряет .session_key при деплое)
 """
 
-import os, sys, json, base64, io, asyncio, secrets, time, threading
+import os, sys, json, base64, io, asyncio, secrets, time, threading, tempfile
 from pathlib import Path
 from functools import wraps
 from typing import Dict, Optional
@@ -19,13 +20,13 @@ from typing import Dict, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # ── FastAPI (WebSocket + proxy) ───────────────────────────────────────
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import JSONResponse
-from starlette.middleware.sessions import SessionMiddleware
 
 OPERATOR_PASSWORD = os.environ.get("OPERATOR_PASSWORD", "")
 RELAY_AGENT_TOKEN = os.environ.get("RELAY_AGENT_TOKEN") or OPERATOR_PASSWORD
 SECRET_KEY        = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+DEBUG_TOKEN       = os.environ.get("DEBUG_TOKEN", "")
 PORT              = int(os.environ.get("PORT", 8000))
 
 if not OPERATOR_PASSWORD:
@@ -34,8 +35,11 @@ if not RELAY_AGENT_TOKEN:
     raise RuntimeError("RELAY_AGENT_TOKEN or OPERATOR_PASSWORD must be set")
 
 app = FastAPI(title="Remote Access Relay")
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY,
-                   max_age=86400, https_only=True, same_site="lax")
+
+# SessionMiddleware у FastAPI убран намеренно: ниже мы маунтим Flask через
+# WSGIMiddleware, Flask управляет cookie 'session' сам (через flask_app.secret_key).
+# Две независимые куки 'session' конкурировали бы и браузер получал бы
+# два разных Set-Cookie на каждый ответ.
 
 # ── Agent registry ────────────────────────────────────────────────────
 class AgentRegistry:
@@ -44,7 +48,12 @@ class AgentRegistry:
         self._lock = asyncio.Lock()
 
     async def register(self, agent_id: str, conn_type: str, ws: WebSocket, label: str = ""):
-        old_ws = None
+        """
+        Регистрирует новый WS. Если уже было соединение того же типа — закрываем
+        старое. Закрытие выполняется ВНУТРИ лока: иначе между снятием лока и
+        old_ws.close() новый поток может уже подменить запись, и мы случайно
+        закроем актуальный WS.
+        """
         async with self._lock:
             if agent_id not in self._agents:
                 self._agents[agent_id] = {"cmd": None, "scr": None, "file": None,
@@ -52,22 +61,19 @@ class AgentRegistry:
             old_ws = self._agents[agent_id].get(conn_type)
             self._agents[agent_id][conn_type] = ws
             self._agents[agent_id]["label"] = label or agent_id
-        # Закрываем старое соединение ВНЕ лока — закрытие может занять время
-        if old_ws is not None and old_ws is not ws:
-            print(f"[relay] evicting stale {agent_id}/{conn_type} (reconnect)")
-            try:
-                await old_ws.close(code=4001)
-            except Exception:
-                pass
+            # Закрываем старый WS ВНУТРИ лока — серилизуем со следующим register/unregister.
+            if old_ws is not None and old_ws is not ws:
+                print(f"[relay] evicting stale {agent_id}/{conn_type} (reconnect)")
+                try:
+                    await old_ws.close(code=4001)
+                except Exception:
+                    pass
 
     async def unregister(self, agent_id: str, conn_type: str, ws: WebSocket = None):
         async with self._lock:
             if agent_id in self._agents:
-                # Если передан ws — разрегистрируем только если это тот же объект.
-                # Иначе новое соединение уже заняло слот и трогать его нельзя.
                 current = self._agents[agent_id].get(conn_type)
                 if ws is not None and current is not ws:
-                    print(f"[relay] unregister skipped {agent_id}/{conn_type}: ws={id(ws)} replaced by ws={id(current)}")
                     return
                 self._agents[agent_id][conn_type] = None
                 if all(self._agents[agent_id].get(k) is None for k in ("cmd", "scr", "file")):
@@ -86,15 +92,11 @@ class AgentRegistry:
 
 registry = AgentRegistry()
 
-# _pending хранит Future по req_id.
-# _pending_meta хранит (agent_id, conn_type) для каждого req_id —
-# чтобы при дисконнекте агента отменить все его зависшие запросы.
 _pending: Dict[str, asyncio.Future] = {}
-_pending_meta: Dict[str, tuple] = {}   # req_id -> (agent_id, conn_type)
+_pending_meta: Dict[str, tuple] = {}
 
 
 def _cancel_pending_for(agent_id: str, conn_type: str):
-    """Отменить все зависшие Future для данного агента/типа соединения."""
     stale = [rid for rid, (aid, ct) in list(_pending_meta.items())
              if aid == agent_id and ct == conn_type]
     for rid in stale:
@@ -114,8 +116,16 @@ async def health():
 
 
 @app.get("/debug/agents")
-async def debug_agents():
-    """Показывает всех подключённых агентов. Убрать в production."""
+async def debug_agents(request: Request):
+    """
+    Доступ только с токеном из env DEBUG_TOKEN. Без токена endpoint утекал бы
+    список агентов и кол-во pending-запросов (топология сети).
+    """
+    if not DEBUG_TOKEN:
+        raise HTTPException(status_code=404, detail="Not found")
+    token = request.headers.get("X-Debug-Token") or request.query_params.get("token", "")
+    if not secrets.compare_digest(token, DEBUG_TOKEN):
+        raise HTTPException(status_code=403, detail="Forbidden")
     return {"agents": registry.list_agents(), "pending": len(_pending)}
 
 
@@ -132,19 +142,16 @@ async def ws_agent(websocket: WebSocket, agent_id: str, conn_type: str):
     print(f"[relay] connected: {agent_id}/{conn_type} ws={ws_id}")
     try:
         while True:
-            # Принимаем любой тип сообщения — текст или бинарный
             msg = await websocket.receive()
             if msg["type"] == "websocket.disconnect":
-                print(f"[relay] got disconnect frame: {agent_id}/{conn_type} ws={ws_id}")
                 break
             if "text" in msg:
                 raw = msg["text"]
             elif "bytes" in msg:
-                # Бинарный фрейм от агента: [req_id 16 байт][W:4][H:4][fmt:1][img]
                 raw_bytes = msg["bytes"]
                 if len(raw_bytes) > 16:
                     req_id_b = raw_bytes[:16].rstrip(b'\x00').decode('utf-8', errors='replace')
-                    frame_data = raw_bytes[16:]   # [W:4][H:4][fmt:1][img]
+                    frame_data = raw_bytes[16:]
                     if req_id_b in _pending:
                         fut = _pending.pop(req_id_b)
                         _pending_meta.pop(req_id_b, None)
@@ -167,8 +174,6 @@ async def ws_agent(websocket: WebSocket, agent_id: str, conn_type: str):
     except Exception as ws_exc:
         print(f"[relay] ws error: {agent_id}/{conn_type} ws={ws_id}: {ws_exc}")
     finally:
-        # Отменяем все зависшие запросы этого соединения,
-        # чтобы при повторном подключении агента не было утечки Future-объектов.
         _cancel_pending_for(agent_id, conn_type)
         await registry.unregister(agent_id, conn_type, websocket)
         print(f"[relay] disconnected: {agent_id}/{conn_type} ws={ws_id}")
@@ -229,7 +234,12 @@ async def ws_stream(websocket: WebSocket, agent_id: str):
             except Exception:
                 break
 
-    asyncio.create_task(_recv_settings())
+    settings_task = asyncio.create_task(_recv_settings())
+
+    # Дождаться готовности _main_loop. Если uvicorn ещё не закончил startup,
+    # _main_loop может быть None — короткая пауза с проверкой.
+    if _main_loop is None:
+        await _main_loop_ready.wait()
 
     try:
         while not closed:
@@ -257,10 +267,8 @@ async def ws_stream(websocket: WebSocket, agent_id: str):
                 if closed: break
 
                 if isinstance(response, (bytes, bytearray)):
-                    # Бинарный фрейм от агента — пересылаем напрямую
                     await websocket.send_bytes(bytes(response))
                 else:
-                    # JSON fallback
                     resp_obj = json.loads(response)
                     p = resp_obj.get("payload", resp_obj)
                     if p.get("data"):
@@ -276,9 +284,12 @@ async def ws_stream(websocket: WebSocket, agent_id: str):
                 await asyncio.sleep(max(0, (1 / fps) - elapsed))
 
             except asyncio.TimeoutError:
+                # Очищаем обе мапы: meta тоже могла остаться, что вело к утечке.
                 _pending.pop(req_id, None)
+                _pending_meta.pop(req_id, None)
             except Exception as e:
                 _pending.pop(req_id, None)
+                _pending_meta.pop(req_id, None)
                 break
 
     except WebSocketDisconnect:
@@ -287,20 +298,22 @@ async def ws_stream(websocket: WebSocket, agent_id: str):
         print(f"[relay] stream WS error: {e}")
     finally:
         closed = True
+        settings_task.cancel()
+        try:
+            await settings_task
+        except Exception:
+            pass
         print(f"[relay] stream WS closed: {agent_id}")
 
 
 # ── Flask (веб-интерфейс оператора) ──────────────────────────────────
 from flask import (Flask, render_template, request as freq, jsonify as fjsonify,
                    session, redirect, url_for, send_file, abort)
-from jinja2 import Environment, FileSystemLoader
 from starlette.middleware.wsgi import WSGIMiddleware
 
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 
 flask_app = Flask(__name__, template_folder=str(TEMPLATES_DIR))
-
-# Ключ сессии — тот же что у FastAPI
 flask_app.secret_key = SECRET_KEY
 flask_app.config.update({
     "MAX_CONTENT_LENGTH":         2 * 1024 * 1024 * 1024,
@@ -312,7 +325,38 @@ flask_app.config.update({
 
 SESSION_VERSION = 1
 _progress: dict = {}
+_progress_lock = threading.Lock()
 import uuid as _uuid
+
+# Записи отдачи (download/zip) могут весить десятки МБ — на free Render
+# 512 МБ это всего ~10 не-забранных скачиваний. GC удаляет завершённые/
+# отменённые/ошибочные записи старше TTL.
+_PROGRESS_TTL_SEC = 10 * 60
+
+
+def _progress_gc():
+    while True:
+        time.sleep(60)
+        try:
+            now = time.time()
+            with _progress_lock:
+                stale = [uid for uid, p in _progress.items()
+                         if (now - p.get("created_at", now) > _PROGRESS_TTL_SEC)
+                         and (p.get("done") or p.get("error") or p.get("cancelled"))]
+                for uid in stale:
+                    prog = _progress.pop(uid, None)
+                    # Удалить temp-файл если он был
+                    if prog and prog.get("data_path"):
+                        try: os.unlink(prog["data_path"])
+                        except Exception: pass
+            if stale:
+                print(f"[relay/gc] purged {len(stale)} stale progress entries")
+        except Exception as e:
+            print(f"[relay/gc] error: {e}")
+
+
+threading.Thread(target=_progress_gc, daemon=True).start()
+
 
 # ── Rate limiter ──────────────────────────────────────────────────────
 from collections import defaultdict
@@ -330,43 +374,51 @@ class _RL:
             return False, 0
     def record(self, ip):
         with self._lock: self._a[ip].append(time.time())
-    def clear(self, ip):
-        with self._lock: self._a.pop(ip, None)
     def remaining(self, ip):
-        return max(0, self.max_a - len(self._a.get(ip, [])))
+        with self._lock:
+            return max(0, self.max_a - len(self._a.get(ip, [])))
 
 _rl = _RL()
 
-# ── Relay conn: прямой вызов без HTTP ────────────────────────────────
-# Flask запущен внутри uvicorn через WSGIMiddleware.
-# HTTP-запрос из Flask к тому же uvicorn вызывает дедлок:
-# uvicorn ждёт Flask → Flask ждёт uvicorn → никто не отвечает.
-# Решение: Flask вызывает relay-логику напрямую через asyncio,
-# минуя HTTP-стек.
 
+# ── Loop capture ──────────────────────────────────────────────────────
+# _main_loop устанавливается в startup-обработчике.
+# _main_loop_ready — threading.Event для синхронной части (Flask thread).
+# _main_loop_ready_aio — asyncio.Event для async-части (ws_stream).
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+_main_loop_ready_threading = threading.Event()
+_main_loop_ready: Optional[asyncio.Event] = None
 
-# Глобальный event loop — устанавливается когда uvicorn стартует
-_main_loop: asyncio.AbstractEventLoop = None
 
 @app.on_event("startup")
 async def _capture_loop():
-    global _main_loop
+    global _main_loop, _main_loop_ready
     _main_loop = asyncio.get_event_loop()
+    _main_loop_ready = asyncio.Event()
+    _main_loop_ready.set()
+    _main_loop_ready_threading.set()
 
 
-def _relay_call_sync(agent_id: str, conn_type: str, body: str, timeout: int = 120) -> dict:
+def _relay_call_sync(agent_id: str, conn_type: str, body: str, timeout: int = 120):
+    """
+    Синхронный вызов из Flask-потока в asyncio-loop.
+
+    Flask воркер (uvicorn даёт по сути 1 thread на запрос через WSGIMiddleware)
+    блокируется на time.result() пока ws_agent не вернёт ответ. На free Render
+    с 1 worker'ом долгие операции делают сервер недоступным — поэтому
+    выставляйте таймауты разумно и предпочитайте чанковые операции, у которых
+    каждый _call_type короткий.
+    """
     import concurrent.futures
 
-    if _main_loop is None:
-        print(f"[relay] ERROR: _main_loop is None! startup event не сработал?")
+    # Ждём пока startup-event захватит loop. Запросы могут прилететь до
+    # завершения startup — лучше подождать пару секунд чем сразу отдать ошибку.
+    if not _main_loop_ready_threading.wait(timeout=5.0):
         return {"error": "Relay not ready - loop not initialized"}
-
-    print(f"[relay] call: agent={agent_id} conn={conn_type} body={body[:80]}")
 
     async def _send():
         ws = registry.get_ws(agent_id, conn_type)
         if ws is None:
-            print(f"[relay] ERROR: no WS for {agent_id}/{conn_type}, registry={registry.list_agents()}")
             return {"error": f"Agent '{agent_id}' not connected ({conn_type})"}
         req_id   = secrets.token_hex(8)
         fut      = _main_loop.create_future()
@@ -376,10 +428,8 @@ def _relay_call_sync(agent_id: str, conn_type: str, body: str, timeout: int = 12
         try:
             await ws.send_text(envelope)
             response = await asyncio.wait_for(fut, timeout=timeout)
-            # Бинарный ответ (скриншот WebP/JPEG) — возвращаем как есть
             if isinstance(response, (bytes, bytearray)):
                 return response
-            print(f"[relay] response: {str(response)[:80]}")
             return json.loads(response)
         except asyncio.TimeoutError:
             _pending.pop(req_id, None)
@@ -407,12 +457,13 @@ class _Conn:
         body = json.dumps({"type": msg_type, "payload": payload})
         return _relay_call_sync(self.aid, self.ctype, body, self.timeout)
 
-    def _download_file_via_chunks(self, path: str, progress_cb=None, cancelled_fn=None) -> bytes:
+    def _download_file_via_chunks(self, path: str, progress_cb=None,
+                                  cancelled_fn=None, sink_path: str = None) -> bytes:
         """
-        Поддерживает оба варианта ответа:
-        - file_data (малые файлы)
-        - dchunk_* (большие файлы)
-        cancelled_fn() — функция без аргументов, возвращает True если передача отменена.
+        Скачивание файла. Если передан sink_path — чанки потоково пишутся
+        в файл, в RAM хранится только текущий чанк. Возвращает None при sink_path.
+        Без sink_path возвращает bytes (старое поведение для совместимости —
+        НЕ ИСПОЛЬЗОВАТЬ для больших файлов).
         """
         first = self._call_type("file_download", {"path": path})
         if isinstance(first, dict) and first.get("type") == "error":
@@ -421,6 +472,13 @@ class _Conn:
         if isinstance(first, dict) and first.get("type") == "file_data":
             data_b64 = first.get("payload", {}).get("data", "")
             data = base64.b64decode(data_b64) if data_b64 else b""
+            if sink_path:
+                with open(sink_path, "wb") as f:
+                    f.write(data)
+                if progress_cb:
+                    try: progress_cb(len(data), len(data))
+                    except Exception: pass
+                return None
             if progress_cb:
                 try: progress_cb(len(data), len(data))
                 except Exception: pass
@@ -431,150 +489,122 @@ class _Conn:
 
         total = int(first.get("payload", {}).get("total_size", 0) or 0)
         n     = int(first.get("payload", {}).get("total_chunks", 0) or 0)
-        print(f"[relay] dchunk begin: path={path} total={total} chunks={n}")
 
-        # Проверяем отмену сразу после начала — до отправки первого ACK
         if cancelled_fn and cancelled_fn():
-            print(f"[relay] dchunk cancelled before start, sending dchunk_cancel to agent path={path}")
             self._call_type("dchunk_cancel", {"reason": "cancelled_by_operator"})
             raise InterruptedError("download cancelled by operator")
 
-        resp = self._call_type("dchunk_ack", {"index": -1})  # ACK begin -> ждём chunk #0
-        buf  = bytearray()
-        for i in range(n):
-            # Проверяем отмену ПЕРЕД обработкой чанка — отправляем cancel агенту
-            if cancelled_fn and cancelled_fn():
-                print(f"[relay] dchunk cancelled at chunk={i+1}/{n}, sending dchunk_cancel to agent path={path}")
-                self._call_type("dchunk_cancel", {"reason": "cancelled_by_operator"})
-                raise InterruptedError("download cancelled by operator")
+        resp = self._call_type("dchunk_ack", {"index": -1})
 
-            if not (isinstance(resp, dict) and resp.get("type") == "dchunk_data"):
-                raise RuntimeError(f"unexpected chunk response #{i}: {resp}")
-            chunk_b64 = resp.get("payload", {}).get("data", "")
-            chunk     = base64.b64decode(chunk_b64) if chunk_b64 else b""
-            buf += chunk
-            if progress_cb:
-                try: progress_cb(len(buf), total)
+        fh = None
+        buf = None
+        if sink_path:
+            fh = open(sink_path, "wb")
+        else:
+            buf = bytearray()
+        received = 0
+        try:
+            for i in range(n):
+                if cancelled_fn and cancelled_fn():
+                    self._call_type("dchunk_cancel", {"reason": "cancelled_by_operator"})
+                    raise InterruptedError("download cancelled by operator")
+
+                if not (isinstance(resp, dict) and resp.get("type") == "dchunk_data"):
+                    raise RuntimeError(f"unexpected chunk response #{i}: {resp}")
+                chunk_b64 = resp.get("payload", {}).get("data", "")
+                chunk     = base64.b64decode(chunk_b64) if chunk_b64 else b""
+                if fh:
+                    fh.write(chunk)
+                else:
+                    buf.extend(chunk)  # extend быстрее чем +=, не создаёт промежуточные копии
+                received += len(chunk)
+                if progress_cb:
+                    try: progress_cb(received, total)
+                    except Exception: pass
+                resp = self._call_type("dchunk_ack", {"index": i})
+
+            if not (isinstance(resp, dict) and resp.get("type") == "dchunk_end"):
+                raise RuntimeError(f"expected dchunk_end, got: {resp}")
+        finally:
+            if fh:
+                try: fh.close()
                 except Exception: pass
-            if i == 0 or i == n - 1 or i % 20 == 0:
-                print(f"[relay] dchunk data: path={path} chunk={i+1}/{n} size={len(chunk)}")
-            resp = self._call_type("dchunk_ack", {"index": i})
 
-        if not (isinstance(resp, dict) and resp.get("type") == "dchunk_end"):
-            raise RuntimeError(f"expected dchunk_end, got: {resp}")
-        print(f"[relay] dchunk end: path={path} received={len(buf)}")
-        return bytes(buf)
+        return None if sink_path else bytes(buf)
 
-    def _download_zip_via_chunks(self, paths: list, progress_cb=None, cancelled_fn=None) -> bytes:
-        """
-        FILE_ZIP_STREAM на агенте использует следующий протокол:
-          агент → FILE_DATA {total_size, total_chunks}   (мета, без поля data)
-          агент → CHUNK_DATA {index, data} × N            (чанки, ждут CHUNK_ACK)
-          агент → OK {total_size}                         (финал)
-
-        При отмене (cancelled_fn() == True) шлём агенту DCHUNK_CANCEL вместо
-        очередного CHUNK_ACK — агент выходит из цикла по этому типу сообщения.
-        """
-        print(f"[relay] zip stream start: paths={paths}")
+    def _download_zip_via_chunks(self, paths: list, progress_cb=None,
+                                 cancelled_fn=None, sink_path: str = None) -> bytes:
         meta = self._call_type("file_zip_stream", {"paths": paths})
-        print(f"[relay] zip stream meta response: type={meta.get('type') if isinstance(meta, dict) else type(meta)}")
 
         if isinstance(meta, dict) and meta.get("type") == "error":
             reason = meta.get("payload", {}).get("reason", "zip stream failed")
-            print(f"[relay] zip stream error from agent: {reason}")
             raise RuntimeError(reason)
 
         if not (isinstance(meta, dict) and meta.get("type") == "file_data"):
-            print(f"[relay] zip stream unexpected first message: {meta}")
             raise RuntimeError(f"expected file_data meta, got: {meta}")
 
         total = int(meta.get("payload", {}).get("total_size", 0) or 0)
         n     = int(meta.get("payload", {}).get("total_chunks", 0) or 0)
-        print(f"[relay] zip stream begin: total={total} bytes, chunks={n}")
 
-        # Проверяем отмену до первого ACK
         if cancelled_fn and cancelled_fn():
-            print(f"[relay] zip stream cancelled before start, sending dchunk_cancel")
             self._call_type("dchunk_cancel", {"reason": "cancelled_by_operator"})
             raise InterruptedError("zip download cancelled by operator")
 
-        buf = bytearray()
-        for i in range(n):
-            # Проверяем отмену ПЕРЕД отправкой ACK.
-            # Если отменено — шлём DCHUNK_CANCEL вместо CHUNK_ACK, агент выходит из цикла.
-            if cancelled_fn and cancelled_fn():
-                print(f"[relay] zip stream cancelled at chunk={i+1}/{n}, sending dchunk_cancel instead of chunk_ack")
-                self._call_type("dchunk_cancel", {"reason": "cancelled_by_operator"})
-                raise InterruptedError("zip download cancelled by operator")
+        fh = None
+        buf = None
+        if sink_path:
+            fh = open(sink_path, "wb")
+        else:
+            buf = bytearray()
+        received = 0
+        try:
+            for i in range(n):
+                if cancelled_fn and cancelled_fn():
+                    self._call_type("dchunk_cancel", {"reason": "cancelled_by_operator"})
+                    raise InterruptedError("zip download cancelled by operator")
 
-            # ACK предыдущего чанка (для i=0: index=-1 — сигнал "готов к первому").
-            # Этот вызов блокирующий — пока агент не пришлёт chunk_data, поток висит.
-            resp = self._call_type("chunk_ack", {"index": i - 1})
-            resp_type = resp.get("type") if isinstance(resp, dict) else type(resp)
-            if i == 0 or i == n - 1 or i % 20 == 0:
-                print(f"[relay] zip stream chunk response #{i}: type={resp_type}")
+                resp = self._call_type("chunk_ack", {"index": i - 1})
+                if not (isinstance(resp, dict) and resp.get("type") == "chunk_data"):
+                    raise RuntimeError(f"unexpected zip chunk response #{i}: {resp}")
 
-            if not (isinstance(resp, dict) and resp.get("type") == "chunk_data"):
-                print(f"[relay] zip stream unexpected chunk response #{i}: {resp}")
-                raise RuntimeError(f"unexpected zip chunk response #{i}: {resp}")
+                chunk_b64 = resp.get("payload", {}).get("data", "")
+                chunk     = base64.b64decode(chunk_b64) if chunk_b64 else b""
+                if fh:
+                    fh.write(chunk)
+                else:
+                    buf.extend(chunk)
+                received += len(chunk)
 
-            chunk_b64 = resp.get("payload", {}).get("data", "")
-            chunk     = base64.b64decode(chunk_b64) if chunk_b64 else b""
-            buf += chunk
+                if cancelled_fn and cancelled_fn():
+                    self._call_type("dchunk_cancel", {"reason": "cancelled_by_operator"})
+                    raise InterruptedError("zip download cancelled by operator")
 
-            # Проверяем отмену СРАЗУ ПОСЛЕ получения чанка, до progress_cb.
-            # Это позволяет отреагировать как только блокирующий _call_type вернулся.
-            if cancelled_fn and cancelled_fn():
-                print(f"[relay] zip stream cancelled after chunk={i+1}/{n}, sending dchunk_cancel")
-                self._call_type("dchunk_cancel", {"reason": "cancelled_by_operator"})
-                raise InterruptedError("zip download cancelled by operator")
+                if progress_cb:
+                    try: progress_cb(received, total)
+                    except InterruptedError: raise
+                    except Exception: pass
 
-            if progress_cb:
-                try: progress_cb(len(buf), total)
-                except InterruptedError: raise
+            final = self._call_type("chunk_ack", {"index": n - 1})
+            if not (isinstance(final, dict) and final.get("type") == "ok"):
+                raise RuntimeError(f"expected ok, got: {final}")
+        finally:
+            if fh:
+                try: fh.close()
                 except Exception: pass
-            if i == 0 or i == n - 1 or i % 20 == 0:
-                print(f"[relay] zip stream chunk={i+1}/{n} size={len(chunk)} total_so_far={len(buf)}")
 
-        # Финальный ACK последнего чанка — агент отвечает OK
-        final = self._call_type("chunk_ack", {"index": n - 1})
-        print(f"[relay] zip stream final response: type={final.get('type') if isinstance(final, dict) else type(final)}")
-        if not (isinstance(final, dict) and final.get("type") == "ok"):
-            print(f"[relay] zip stream unexpected final: {final}")
-            raise RuntimeError(f"expected ok, got: {final}")
+        return None if sink_path else bytes(buf)
 
-        print(f"[relay] zip stream done: received={len(buf)} bytes")
-        return bytes(buf)
-
-    def _upload_file_via_chunks(self, remote_path: str, data: bytes, progress_cb=None, cancelled_fn=None):
-        """
-        Чанковая загрузка файла на агента через relay.
-        Протокол агента (handler._chunk_begin / _chunk_data / _chunk_end):
-          relay → CHUNK_BEGIN {path, total_chunks, total_size}
-          агент → CHUNK_ACK  {index: -1}           (ready)
-          loop:
-            relay → CHUNK_DATA {index, data}
-            агент → CHUNK_ACK  {index}
-          relay → CHUNK_END {}
-          агент → CHUNK_OK  {path, size}
-
-        При отмене (cancelled_fn() == True) шлём CHUNK_CANCEL — агент закрывает
-        и удаляет частичный файл, освобождая блокировку (WinError 32).
-        """
+    def _upload_file_via_chunks(self, remote_path: str, data: bytes,
+                                progress_cb=None, cancelled_fn=None):
         from common.protocol import CHUNK_SIZE
         total  = len(data)
         chunks = [data[i:i+CHUNK_SIZE] for i in range(0, max(total, 1), CHUNK_SIZE)]
         n      = len(chunks)
-        print(f"[relay] upload chunks start: path={remote_path} total={total} chunks={n}")
 
-        # Проверяем отмену до chunk_begin — файл ещё не открыт на агенте
         if cancelled_fn and cancelled_fn():
-            print(f"[relay] upload cancelled before chunk_begin, skipping")
             raise InterruptedError("upload cancelled before start")
 
-        # CHUNK_BEGIN → ждём CHUNK_ACK {index:-1}
         resp = self._call_type("chunk_begin", {"path": remote_path, "total_chunks": n, "total_size": total})
-        print(f"[relay] upload chunk_begin response: type={resp.get('type') if isinstance(resp, dict) else type(resp)}")
         if isinstance(resp, dict) and resp.get("type") == "error":
             raise RuntimeError(resp.get("payload", {}).get("reason", "chunk_begin failed"))
         if not (isinstance(resp, dict) and resp.get("type") == "chunk_ack"):
@@ -582,9 +612,7 @@ class _Conn:
 
         sent = 0
         for i, chunk in enumerate(chunks):
-            # Проверяем отмену ПЕРЕД отправкой чанка
             if cancelled_fn and cancelled_fn():
-                print(f"[relay] upload cancelled at chunk={i+1}/{n}, sending chunk_cancel")
                 self._call_type("chunk_cancel", {})
                 raise InterruptedError("upload cancelled by operator")
 
@@ -597,9 +625,7 @@ class _Conn:
 
             sent += len(chunk)
 
-            # Проверяем отмену ПОСЛЕ получения ACK — как только блокировка снята
             if cancelled_fn and cancelled_fn():
-                print(f"[relay] upload cancelled after chunk={i+1}/{n}, sending chunk_cancel")
                 self._call_type("chunk_cancel", {})
                 raise InterruptedError("upload cancelled by operator")
 
@@ -607,15 +633,10 @@ class _Conn:
                 try: progress_cb(sent, total)
                 except InterruptedError: raise
                 except Exception: pass
-            if i == 0 or i == n - 1 or i % 20 == 0:
-                print(f"[relay] upload chunk={i+1}/{n} size={len(chunk)} sent={sent}")
 
-        # CHUNK_END → ждём CHUNK_OK
         final = self._call_type("chunk_end", {})
-        print(f"[relay] upload chunk_end response: type={final.get('type') if isinstance(final, dict) else type(final)}")
         if isinstance(final, dict) and final.get("type") == "error":
             raise RuntimeError(final.get("payload", {}).get("reason", "chunk_end failed"))
-        print(f"[relay] upload done: path={remote_path} sent={sent} bytes")
         return final
 
     def call(self, method, *args, **kwargs):
@@ -624,12 +645,14 @@ class _Conn:
                 args[0] if args else "",
                 kwargs.get("progress_cb") or (args[1] if len(args) > 1 else None),
                 kwargs.get("cancelled_fn") or (args[2] if len(args) > 2 else None),
+                sink_path=kwargs.get("sink_path"),
             )
         if method == "download_zip":
             return self._download_zip_via_chunks(
                 args[0] if args else [],
                 kwargs.get("progress_cb") or (args[1] if len(args) > 1 else None),
                 kwargs.get("cancelled_fn") or (args[2] if len(args) > 2 else None),
+                sink_path=kwargs.get("sink_path"),
             )
         if method == "upload_bytes_chunked":
             return self._upload_file_via_chunks(
@@ -647,8 +670,6 @@ class _Conn:
 
 def _build_payload(method, args, kwargs):
     from common.protocol import MsgType
-    # Используем lambda чтобы вычислять payload только для нужного метода.
-    # Иначе base64.b64encode(args[1]) вычисляется для ВСЕХ записей сразу.
     m = {
         "ping":         lambda: (MsgType.PING, {}),
         "sys_info":     lambda: (MsgType.SYS_INFO, {}),
@@ -687,6 +708,13 @@ def _conns(aid):
     return (_Conn(aid,"cmd"), _Conn(aid,"scr"), _Conn(aid,"file",timeout=600))
 
 
+# ── Path safety ───────────────────────────────────────────────────────
+def _safe_path(p):
+    if not p or not isinstance(p, str): return False
+    if "\x00" in p or len(p) > 4096: return False
+    return True
+
+
 # ── Flask auth ────────────────────────────────────────────────────────
 def _require(fn):
     @wraps(fn)
@@ -700,15 +728,12 @@ def _require(fn):
     return w
 
 def _aid():
-    """agent_id из заголовка X-Agent-Id или query-param."""
     aid = freq.headers.get("X-Agent-Id", "").strip()
     if not aid:
         aid = freq.args.get("agent_id", "").strip()
     if not aid and freq.is_json:
         try: aid = (freq.get_json(silent=True) or {}).get("agent_id", "")
         except Exception: pass
-    if not aid:
-        print(f"[relay] WARNING: X-Agent-Id missing. URL={freq.path} method={freq.method}")
     return aid or ""
 
 @flask_app.route("/")
@@ -727,7 +752,9 @@ def login():
             session.clear()
             session.update({"auth":True,"v":SESSION_VERSION,"created":int(time.time())})
             session.permanent = True
-            _rl.clear(ip)
+            # Намеренно НЕ сбрасываем счётчик: иначе атакующий, имея один
+            # валидный пароль, мог бы успешным логином снять блокировку
+            # с IP и сразу продолжить брутфорс другого пароля.
             return redirect(url_for("index"))
         _rl.record(ip)
         return render_template("login.html", error=f"Неверный пароль. Осталось попыток: {_rl.remaining(ip)}")
@@ -740,8 +767,6 @@ def logout():
 @flask_app.route("/api/agents")
 @_require
 def api_agents():
-    # Читаем registry напрямую — без HTTP запроса к FastAPI
-    # (HTTP через WSGIMiddleware → Flask не знает /api/agents-list → пустой ответ)
     return fjsonify({"agents": registry.list_agents()})
 
 @flask_app.route("/api/ping")
@@ -749,8 +774,15 @@ def api_agents():
 def api_ping():
     aid = _aid()
     if not aid: return fjsonify({"error":"no agent_id"}), 400
-    try: cmd,_,_ = _conns(aid); cmd.call("ping"); return fjsonify({"ok":True})
-    except Exception as e: return fjsonify({"ok":False,"error":str(e)}), 500
+    try:
+        cmd,_,_ = _conns(aid)
+        # ВАЖНО: без скобок "X or True" интерпретируется как (cmd.call("ping") == {...}) or True
+        # → всегда True. Скобки обязательны для оператора precedence.
+        resp = cmd.call("ping")
+        ok = isinstance(resp, dict) and resp.get("type") == "pong"
+        return fjsonify({"ok": ok, "agent_id": aid})
+    except Exception as e:
+        return fjsonify({"ok": False, "error": str(e)}), 500
 
 @flask_app.route("/api/sysinfo")
 @_require
@@ -773,9 +805,7 @@ def api_cmd():
 @flask_app.route("/api/path/parent")
 @_require
 def api_path_parent():
-    from common.protocol import MsgType
     path = freq.args.get("path","")
-    # простой path_parent без импорта server.web
     path = path.rstrip("/\\")
     if not path: return fjsonify({"parent": None})
     if "\\" in path or (len(path)>=2 and path[1]==":"):
@@ -792,7 +822,12 @@ def api_path_parent():
 def api_files():
     aid = _aid()
     if not aid: return fjsonify({"error":"no agent_id"}), 400
-    try: cmd,_,_ = _conns(aid); return fjsonify(cmd.call("file_list", freq.args.get("path","")).get("payload",{}))
+    try:
+        path = freq.args.get("path","")
+        if path and not _safe_path(path):
+            return fjsonify({"error":"invalid path"}), 400
+        cmd,_,_ = _conns(aid)
+        return fjsonify(cmd.call("file_list", path).get("payload",{}))
     except Exception as e: return fjsonify({"error":str(e)}), 500
 
 @flask_app.route("/api/screenshot")
@@ -805,7 +840,6 @@ def api_screenshot():
         _,scr,_ = _conns(aid)
         resp = scr.call("screenshot", quality=int(freq.args.get("quality",60)),
                         capturer=freq.args.get("capturer","dxcam"))
-        # Бинарный ответ: [W:4][H:4][fmt:1][img bytes]
         if isinstance(resp, (bytes, bytearray)):
             if len(resp) >= 9:
                 w   = _st.unpack_from(">I", resp, 0)[0]
@@ -818,7 +852,6 @@ def api_screenshot():
                     "fmt":   "webp" if fmt == 1 else "jpeg",
                 })
             return fjsonify({"error": "bad binary frame"}), 500
-        # JSON-ответ (старый агент)
         p = resp.get("payload", {}) if isinstance(resp, dict) else {}
         if "data" in p:
             return fjsonify({"data": p["data"], "width": p["width"], "height": p["height"]})
@@ -838,7 +871,11 @@ def api_processes():
 def api_proc_kill():
     aid = _aid()
     if not aid: return fjsonify({"error":"no agent_id"}), 400
-    try: cmd,_,_ = _conns(aid); cmd.call("proc_kill", int((freq.json or {}).get("pid",0))); return fjsonify({"ok":True})
+    try:
+        d = freq.json or {}
+        cmd,_,_ = _conns(aid)
+        cmd.call("proc_kill", int(d.get("pid",0)))
+        return fjsonify({"ok":True})
     except Exception as e: return fjsonify({"error":str(e)}), 500
 
 @flask_app.route("/api/mouse/move", methods=["POST"])
@@ -864,8 +901,6 @@ def api_mouse_click():
             return fjsonify({"error": resp.get("payload",{}).get("reason","click failed")}), 500
         return fjsonify({"ok": True})
     except Exception as e:
-        import traceback
-        print(f"[relay] mouse_click ERROR: {e}\n{traceback.format_exc()}\nbody={freq.data}")
         return fjsonify({"error": str(e)}), 500
 
 @flask_app.route("/api/mouse/scroll", methods=["POST"])
@@ -930,7 +965,9 @@ def api_files_delete():
     aid = _aid()
     if not aid: return fjsonify({"error":"no agent_id"}), 400
     try:
-        cmd,_,_=_conns(aid); resp=cmd.call("file_delete",(freq.json or {}).get("path",""))
+        path = (freq.json or {}).get("path","")
+        if not _safe_path(path): return fjsonify({"error":"invalid path"}), 400
+        cmd,_,_=_conns(aid); resp=cmd.call("file_delete",path)
         if resp.get("type")=="error": return fjsonify({"error":resp.get("payload",{}).get("reason","error")}), 500
         return fjsonify({"ok":True})
     except Exception as e: return fjsonify({"error":str(e)}), 500
@@ -940,7 +977,10 @@ def api_files_delete():
 def api_files_mkdir():
     aid = _aid()
     if not aid: return fjsonify({"error":"no agent_id"}), 400
-    try: cmd,_,_=_conns(aid); cmd.call("file_mkdir",(freq.json or {}).get("path","")); return fjsonify({"ok":True})
+    try:
+        path = (freq.json or {}).get("path","")
+        if not _safe_path(path): return fjsonify({"error":"invalid path"}), 400
+        cmd,_,_=_conns(aid); cmd.call("file_mkdir",path); return fjsonify({"ok":True})
     except Exception as e: return fjsonify({"error":str(e)}), 500
 
 @flask_app.route("/api/files/rename", methods=["POST"])
@@ -949,7 +989,10 @@ def api_files_rename():
     aid = _aid()
     if not aid: return fjsonify({"error":"no agent_id"}), 400
     try:
-        d=freq.json or {}; cmd,_,_=_conns(aid)
+        d=freq.json or {}
+        if not (_safe_path(d.get("src","")) and _safe_path(d.get("dst",""))):
+            return fjsonify({"error":"invalid path"}), 400
+        cmd,_,_=_conns(aid)
         cmd.call("file_rename",d.get("src",""),d.get("dst",""))
         return fjsonify({"ok":True})
     except Exception as e: return fjsonify({"error":str(e)}), 500
@@ -969,12 +1012,6 @@ def api_files_zip():
 @flask_app.route("/api/files/upload", methods=["POST"])
 @_require
 def api_files_upload():
-    """
-    Возвращает {upload_id} НЕМЕДЛЕННО — до чтения файла.
-    Это позволяет клиенту зарегистрировать uid для отмены ещё до того,
-    как f.read() заблокирует поток (для больших файлов это секунды).
-    Чтение файла и передача агенту происходят внутри фонового потока.
-    """
     aid = _aid()
     if not aid: return fjsonify({"error":"no agent_id"}), 400
     try:
@@ -982,59 +1019,42 @@ def api_files_upload():
         if not f: return fjsonify({"error":"no file"}), 400
         remote_path = freq.form.get("path","")
         if not remote_path: return fjsonify({"error":"no path"}), 400
+        if not _safe_path(remote_path): return fjsonify({"error":"invalid path"}), 400
 
         uid = str(_uuid.uuid4())
-        # Регистрируем uid немедленно — клиент может отменить ещё до f.read()
         _progress[uid] = {"sent":0,"total":0,"done":False,"error":None,"cancelled":False,
-                           "reading":True}
-        print(f"[relay/upload] registered uid={uid} path={remote_path}")
+                           "reading":True,"created_at":time.time()}
 
-        # Читаем файл в памяти внутри фонового потока — не блокируем ответ
-        file_storage = f  # werkzeug FileStorage, читается один раз
+        file_storage = f
 
         def _run():
-            SMALL = 2 * 1024 * 1024  # base64-overhead ×4/3 → макс ~2.7 МБ в WS-фрейме
+            SMALL = 2 * 1024 * 1024
             try:
-                # Отмена до чтения файла — выходим сразу
                 if _progress.get(uid, {}).get("cancelled"):
-                    print(f"[relay/upload] cancelled before read uid={uid}")
                     _progress[uid]["done"] = True
                     return
 
-                print(f"[relay/upload] reading file uid={uid}")
                 data = file_storage.read()
                 _progress[uid]["total"] = len(data)
                 _progress[uid]["reading"] = False
-                print(f"[relay/upload] read done uid={uid} size={len(data)}")
 
-                # Повторная проверка отмены после чтения
                 if _progress.get(uid, {}).get("cancelled"):
-                    print(f"[relay/upload] cancelled after read uid={uid}")
                     return
 
                 _,_,file_c = _conns(aid)
 
                 if len(data) <= SMALL:
-                    print(f"[relay/upload] small file, single call uid={uid}")
                     resp = file_c.call("upload_bytes", remote_path, data)
-                    print(f"[relay/upload] small call resp: {str(resp)[:120]}")
                     if not isinstance(resp, dict):
                         _progress[uid]["error"] = f"unexpected response: {type(resp).__name__}"
                     elif resp.get("type") == "error":
-                        # Ошибка от агента: {type:error, payload:{reason:...}}
                         _progress[uid]["error"] = resp.get("payload", {}).get("reason", "agent error")
                     elif "error" in resp:
-                        # Ошибка relay (таймаут, обрыв WS): {error:"..."}
-                        err = resp["error"]
-                        print(f"[relay/upload] small relay error uid={uid}: {err}")
-                        _progress[uid]["error"] = err
+                        _progress[uid]["error"] = resp["error"]
                     else:
                         _progress[uid].update({"sent": len(data), "done": True})
-                        print(f"[relay/upload] small done uid={uid}")
                 else:
-                    print(f"[relay/upload] large file, chunked upload uid={uid}")
                     if _progress.get(uid, {}).get("cancelled"):
-                        print(f"[relay/upload] cancelled before chunk_begin uid={uid}")
                         return
                     def cb(sent, total):
                         if _progress.get(uid, {}).get("cancelled"):
@@ -1045,32 +1065,32 @@ def api_files_upload():
                     resp = file_c.call("upload_bytes_chunked", remote_path, data,
                                        progress_cb=cb, cancelled_fn=is_cancelled)
                     if _progress.get(uid, {}).get("cancelled"):
-                        print(f"[relay/upload] cancelled uid={uid}")
                         return
-                    print(f"[relay/upload] large call resp: {str(resp)[:120]}")
                     if not isinstance(resp, dict):
                         _progress[uid]["error"] = f"unexpected response: {type(resp).__name__}"
                     elif resp.get("type") == "error":
                         _progress[uid]["error"] = resp.get("payload", {}).get("reason", "agent error")
                     elif "error" in resp:
-                        err = resp["error"]
-                        print(f"[relay/upload] large relay error uid={uid}: {err}")
-                        _progress[uid]["error"] = err
+                        _progress[uid]["error"] = resp["error"]
                     else:
                         _progress[uid].update({"sent": len(data), "done": True})
-                        print(f"[relay/upload] large done uid={uid} size={len(data)}")
             except InterruptedError:
-                print(f"[relay/upload] interrupted (cancelled) uid={uid}")
+                pass
             except Exception as e:
-                print(f"[relay/upload] error uid={uid} err={e}")
-                # Сбрасываем reading чтобы клиент вышел из shimmer-анимации и увидел ошибку
                 _progress[uid]["reading"] = False
                 _progress[uid]["error"] = str(e)
 
         threading.Thread(target=_run, daemon=True).start()
-        # Возвращаем uid немедленно — клиент начнёт polling и сможет отменить
         return fjsonify({"upload_id": uid, "done": False, "total": 0})
     except Exception as e: return fjsonify({"error":str(e)}), 500
+
+
+def _mk_temp_sink() -> str:
+    """Возвращает путь к временному файлу-приёмнику. Файл создаётся пустым."""
+    fd, path = tempfile.mkstemp(prefix="dl_", suffix=".bin")
+    os.close(fd)
+    return path
+
 
 @flask_app.route("/api/files/download")
 @_require
@@ -1079,9 +1099,12 @@ def api_files_download():
     if not aid: return fjsonify({"error":"no agent_id"}), 400
     try:
         remote_path = freq.args.get("path","")
+        if not _safe_path(remote_path): return fjsonify({"error":"invalid path"}), 400
         fname = remote_path.replace("\\","/").split("/")[-1] or "file"
         uid   = str(_uuid.uuid4())
-        _progress[uid] = {"received":0,"total":0,"done":False,"error":None,"cancelled":False,"fname":fname}
+        sink  = _mk_temp_sink()
+        _progress[uid] = {"received":0,"total":0,"done":False,"error":None,"cancelled":False,
+                          "fname":fname,"data_path":sink,"created_at":time.time()}
         _,_,file_c = _conns(aid)
         def _run():
             try:
@@ -1090,21 +1113,21 @@ def api_files_download():
                     _progress[uid]["received"]=recv; _progress[uid]["total"]=total
                 def is_cancelled():
                     return bool(_progress.get(uid, {}).get("cancelled"))
-                print(f"[relay/download] start uid={uid} path={remote_path}")
-                resp = file_c.call("download_bytes_with_progress", remote_path, cb, cancelled_fn=is_cancelled)
+                file_c.call("download_bytes_with_progress", remote_path, cb,
+                            cancelled_fn=is_cancelled, sink_path=sink)
                 if _progress.get(uid,{}).get("cancelled"):
-                    print(f"[relay/download] cancelled uid={uid} path={remote_path}")
+                    try: os.unlink(sink)
+                    except Exception: pass
                     return
-                data = resp if isinstance(resp, bytes) else resp.get("payload",{}).get("data","").encode()
-                if isinstance(resp,dict) and "data" in resp.get("payload",{}):
-                    data = base64.b64decode(resp["payload"]["data"])
-                print(f"[relay/download] done uid={uid} path={remote_path} size={len(data)}")
-                _progress[uid].update({"data":data,"received":len(data),"total":len(data),"done":True})
+                size = os.path.getsize(sink)
+                _progress[uid].update({"received":size,"total":size,"done":True})
             except InterruptedError:
-                print(f"[relay/download] interrupted (cancelled) uid={uid} path={remote_path}")
+                try: os.unlink(sink)
+                except Exception: pass
             except Exception as e:
-                print(f"[relay/download] error uid={uid} path={remote_path} err={e}")
                 _progress[uid]["error"]=str(e)
+                try: os.unlink(sink)
+                except Exception: pass
         threading.Thread(target=_run, daemon=True).start()
         return fjsonify({"download_id":uid})
     except Exception as e: return fjsonify({"error":str(e)}), 500
@@ -1117,7 +1140,9 @@ def api_files_zip_download():
     try:
         d=freq.json or {}; paths=d.get("paths",[]); name=d.get("name","archive.zip")
         uid=str(_uuid.uuid4())
-        _progress[uid]={"received":0,"total":0,"done":False,"error":None,"cancelled":False,"fname":name}
+        sink = _mk_temp_sink()
+        _progress[uid]={"received":0,"total":0,"done":False,"error":None,"cancelled":False,
+                        "fname":name,"data_path":sink,"created_at":time.time()}
         _,_,file_c=_conns(aid)
         def _run():
             try:
@@ -1126,14 +1151,21 @@ def api_files_zip_download():
                     _progress[uid]["received"]=recv; _progress[uid]["total"]=total
                 def is_cancelled_zip():
                     return bool(_progress.get(uid,{}).get("cancelled"))
-                data = file_c.call("download_zip", paths, cb, cancelled_fn=is_cancelled_zip)
+                file_c.call("download_zip", paths, cb,
+                            cancelled_fn=is_cancelled_zip, sink_path=sink)
                 if _progress.get(uid,{}).get("cancelled"):
-                    print(f"[relay/zip-download] cancelled uid={uid}")
+                    try: os.unlink(sink)
+                    except Exception: pass
                     return
-                if isinstance(data, dict): data = base64.b64decode(data.get("payload",{}).get("data",""))
-                _progress[uid].update({"data":data,"received":len(data),"total":len(data),"done":True})
-            except InterruptedError: pass
-            except Exception as e: _progress[uid]["error"]=str(e)
+                size = os.path.getsize(sink)
+                _progress[uid].update({"received":size,"total":size,"done":True})
+            except InterruptedError:
+                try: os.unlink(sink)
+                except Exception: pass
+            except Exception as e:
+                _progress[uid]["error"]=str(e)
+                try: os.unlink(sink)
+                except Exception: pass
         threading.Thread(target=_run, daemon=True).start()
         return fjsonify({"download_id":uid})
     except Exception as e: return fjsonify({"error":str(e)}), 500
@@ -1143,8 +1175,26 @@ def api_files_zip_download():
 def api_files_dl(uid):
     prog=_progress.get(uid)
     if not prog or not prog.get("done"): return fjsonify({"error":"not ready"}), 404
-    data=prog.get("data",b""); fname=prog.get("fname","file")
+    fname=prog.get("fname","file")
+    path = prog.get("data_path")
+    # Удаляем запись из реестра, файл удалим после отдачи (send_file держит fd).
     del _progress[uid]
+    if path and os.path.exists(path):
+        # send_file сам закроет файл; затем планируем удаление temp-файла.
+        def _cleanup(resp):
+            try: os.unlink(path)
+            except Exception: pass
+            return resp
+        try:
+            resp = send_file(path, as_attachment=True, download_name=fname)
+            resp.call_on_close(lambda: (os.path.exists(path) and os.unlink(path)) if path else None)
+            return resp
+        except Exception as e:
+            try: os.unlink(path)
+            except Exception: pass
+            return fjsonify({"error": str(e)}), 500
+    # Старое поведение (в RAM) — fallback на случай если приёмник не использовался
+    data=prog.get("data",b"")
     return send_file(io.BytesIO(data), as_attachment=True, download_name=fname)
 
 @flask_app.route("/api/files/progress/<uid>")
@@ -1152,7 +1202,8 @@ def api_files_dl(uid):
 def api_files_progress(uid):
     prog=_progress.get(uid)
     if not prog: return fjsonify({"error":"unknown id"}), 404
-    return fjsonify({k:v for k,v in prog.items() if k!="data"})
+    # Не возвращаем "data" и "data_path" — это внутренние ключи.
+    return fjsonify({k:v for k,v in prog.items() if k not in ("data","data_path")})
 
 @flask_app.route("/api/files/cancel", methods=["POST"])
 @_require
